@@ -1,0 +1,28 @@
+{
+  "Name": "XP-Pen Artist 22HD",
+  "Specifications": {
+    "Digitizer": {
+      "Width": 476.64,
+      "Height": 268.11,
+      "MaxX": 38161,
+      "MaxY": 21458
+    },
+    "Pen": {
+      "MaxPressure": 2047,
+      "Buttons": {
+        "ButtonCount": 2
+      }
+    }
+  },
+  "DigitizerIdentifiers": [
+    {
+      "VendorID": 21827,
+      "ProductID": 71,
+      "InputReportLength": 8,
+      "ReportParser": "OpenTabletDriver.Configurations.Parsers.XP_Pen.XP_PenReportParser",
+      "InitializationStrings": [
+        100
+      ]
+    }
+  ]
+}
