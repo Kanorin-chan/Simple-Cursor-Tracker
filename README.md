@@ -12,12 +12,14 @@ A Python-based cursor tracking tool designed for OpenTabletDriver users. This ap
 - **Settings persistence** - save and load your preferences 
 - **OBS overlay support** with borderless window options 
 - **OpenTabletDriver integration** - automatically detects tablet configurations 
- 
+- **Automated tablet detection** using a custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` (no manual selection required for most tablets)
+
 ## Installation 
  
 ### Prerequisites 
 - Python 3.7+ 
 - OpenTabletDriver (optional, for tablet configuration detection) 
+- **You must place your custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` in the same folder as this application/executable for automatic tablet detection to work.**
  
 ### Dependencies 
 ```bash 
@@ -30,7 +32,7 @@ pip install pygame pyautogui numpy
 pip install pyinstaller 
  
 # Build executable with configurations 
-pyinstaller --onefile --console --add-data "Configurations;Configurations" --name "CursorTracker" test4.py 
+pyinstaller --onefile --console --add-data "Configurations;Configurations" --name "CursorTracker" cursortracker.py 
 ``` 
  
 ## Usage 
@@ -47,6 +49,14 @@ CursorTracker.exe
 CursorTracker.exe -console 
 ``` 
  
+### Tablet Detection (Automation)
+
+- The application now features **automatic tablet detection** using a custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe`.
+- **You must place the custom daemon executable in the same folder as this application/executable.**
+- When you launch the app, it will attempt to detect your connected tablet automatically and select the correct configuration.
+- If your tablet is not detected, you will be prompted to select a similar configuration manually.
+- This automation reduces setup time and improves user experience for most OpenTabletDriver-compatible tablets.
+
 ### Controls 
  
 - **Settings Button**: Opens the settings panel 
@@ -70,7 +80,11 @@ The settings panel allows you to customize:
 ### Tablet Configuration Files 
  
 This application includes tablet configuration files from [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver). These files contain digitizer specifications for various tablet models and are used to automatically detect tablet dimensions. 
- 
+
+**Automatic Detection:**
+- The app uses a custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` to detect your connected tablet and select the appropriate configuration automatically.
+- If detection fails, you can still manually select a configuration from the provided list.
+
 **Credits:** Tablet configuration files are sourced from the [OpenTabletDriver project](https://github.com/OpenTabletDriver/OpenTabletDriver) under LGPL-3.0 license. 
  
 ### Settings Files 
@@ -89,6 +103,7 @@ The application creates several configuration files in the same directory as the
 - Ensure OpenTabletDriver is running 
 - Check that your tablet is properly connected 
 - Verify OpenTabletDriver settings.json path is correct 
+- If using automation, ensure the custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` is present in the application directory
  
 **Configuration not found:** 
 - The application will prompt you to select a similar tablet configuration 
@@ -108,7 +123,7 @@ The application creates several configuration files in the same directory as the
 pip install pygame pyautogui numpy 
  
 # Run the application 
-python test4.py 
+python cursortracker.py 
 ``` 
  
 ## License 
