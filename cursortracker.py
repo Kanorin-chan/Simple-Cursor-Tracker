@@ -13,6 +13,9 @@ from tkinter import messagebox, filedialog
 import math
 import pygame.gfxdraw
 import argparse
+import psutil
+import threading
+import re
 
 # Now add the argument parsing
 parser = argparse.ArgumentParser(description='Cursor Tracking Tool')
@@ -26,14 +29,153 @@ if not args.console and getattr(sys, 'frozen', False):
 
 # Note: For better window focus management, install pywin32: pip install pywin32
 
+class OTDTabletDetector:
+    def __init__(self, otd_path=None):
+        self.daemon_process = None
+        self.detected_tablets = []
+        self.detected_tablet_info = None
+        # If no path specified, use the directory where this script is located
+        if otd_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            self.otd_path = script_dir
+        else:
+            self.otd_path = otd_path
+        self.daemon_exe = os.path.join(self.otd_path, "opentabletdriver.customdaemon")
+        if os.name == 'nt' and not self.daemon_exe.endswith('.exe'):
+            self.daemon_exe += '.exe'
+
+    def check_otd_installation(self) -> bool:
+        """Check if OpenTabletDriver daemon is installed and accessible"""
+        print(f"=== Diagnostic Information ===")
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"OTD path: {self.otd_path}")
+        print(f"Looking for daemon at: {self.daemon_exe}")
+        try:
+            files = os.listdir(self.otd_path)
+            #Getting the List of file in current folder (DEBUG)
+            #print(f"\nFiles in {self.otd_path}:")
+            for file in sorted(files):
+                full_path = os.path.join(self.otd_path, file)
+                file_type = "DIR" if os.path.isdir(full_path) else "FILE"
+                print(f"  {file_type}: {file}")
+        except Exception as e:
+            print(f"Error listing directory: {e}")
+        if os.path.exists(self.daemon_exe):
+            print(f"\n✓ Daemon executable found: {self.daemon_exe}")
+            return True
+        else:
+            print(f"\n✗ No daemon executable found!")
+            return False
+
+    def is_daemon_running(self):
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'] and 'opentabletdriver.customdaemon' in proc.info['name'].lower():
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return False
+
+    def start_daemon(self) -> bool:
+        """Start the OpenTabletDriver daemon, in a new window if already running."""
+        print("Starting OpenTabletDriver daemon...")
+        print(f"Daemon path: {self.daemon_exe}")
+        if self.is_daemon_running():
+            print("Daemon is already running. Launching in simulation mode.")
+            self.daemon_process = subprocess.Popen(
+                [self.daemon_exe, "-simulation"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=self.otd_path,
+                bufsize=1,
+                universal_newlines=True
+            )
+        else:
+            self.daemon_process = subprocess.Popen(
+                [self.daemon_exe],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=self.otd_path,
+                bufsize=1,
+                universal_newlines=True
+            )
+        time.sleep(3)
+        if self.daemon_process.poll() is None:
+            print("✓ Daemon started successfully")
+            return True
+        else:
+            print("✗ Daemon process terminated")
+            stdout, _ = self.daemon_process.communicate()
+            if stdout:
+                print(f"Daemon output: {stdout}")
+            return False
+
+    def stop_daemon(self):
+        """Stop the OpenTabletDriver daemon"""
+        if self.daemon_process:
+            try:
+                self.daemon_process.terminate()
+                self.daemon_process.wait(timeout=5)
+                print("✓ Daemon stopped")
+            except subprocess.TimeoutExpired:
+                self.daemon_process.kill()
+                print("✓ Daemon force-stopped")
+            except Exception as e:
+                print(f"Error stopping daemon: {e}")
+
+    def run_detection_sequence(self):
+        """Run the complete tablet detection sequence"""
+        print("=== OpenTabletDriver Tablet Detection ===\n")
+        if not self.check_otd_installation():
+            print("✗ OpenTabletDriver daemon not found or not accessible")
+            print("Please ensure OpenTabletDriver is installed and in PATH")
+            return False
+        print("✓ OpenTabletDriver daemon found")
+        if not self.start_daemon():
+            return False
+        threading.Thread(target=self.print_daemon_output, daemon=True).start()
+        time.sleep(10)  # Wait for some output (adjust as needed)
+        print("\n=== Detected Tablets ===")
+        if self.detected_tablets:
+            for i, tablet in enumerate(self.detected_tablets, 1):
+                print(f"  {i}. {tablet}")
+        else:
+            print("  No tablets detected yet (check daemon output above)")
+        return True
+
+    def print_daemon_output(self):
+        """Prints output from the daemon process if available."""
+        if self.daemon_process and self.daemon_process.stdout:
+            for line in self.daemon_process.stdout:
+                print(line, end="")
+
+def main():
+    """Main function to run the tablet detection"""
+    detector = OTDTabletDetector()  # Will auto-detect script directory
+    try:
+        success = detector.run_detection_sequence()
+        if success:
+            print("\n✓ Detection completed successfully")
+        else:
+            print("\n✗ Detection failed")
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+    finally:
+        detector.stop_daemon()
+        print("Cleanup completed")
+
 # Initialize pygame
 pygame.init()
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
+    if hasattr(sys, '_MEIPASS'):
         base_path = sys._MEIPASS
-    except AttributeError:
+    else:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
@@ -137,6 +279,13 @@ active_area_color_preview_rect = None
 background_color_preview_rect = None
 
 background_hex_input_active = False
+
+def show_message(message, duration=500):
+    message_surface = font.render(message, True, BUTTON_TEXT_COLOR)
+    message_rect = message_surface.get_rect(center=(WIN_WIDTH//2, WIN_HEIGHT - 100))
+    screen.blit(message_surface, message_rect)
+    pygame.display.update()
+    pygame.time.wait(duration)
 
 def hsv_to_rgb(h, s, v):
     """Convert HSV to RGB (h: 0-360, s: 0-100, v: 0-100)"""
@@ -417,6 +566,13 @@ def update_color_in_realtime():
 #Cursor & Trail Color
 cursor_rgb_inputs = [pygame.Rect(0, 0, 50, 30) for _ in range(3)]
 trail_rgb_inputs = [pygame.Rect(0, 0, 50, 30) for _ in range(3)]
+# Define active area variables before using them
+active_area_x = 0
+active_area_y = 0
+active_area_width = 216  # Default fallback
+active_area_height = 135  # Default fallback
+active_area_inputs = [pygame.Rect(0, 0, 80, 30) for _ in range(4)]  # Added for active area input boxes
+active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]  # Ensure always defined
 active_input = None
 # Ensure these are lists of int, not restricted types
 cursor_rgb_values = [int(c) for c in cursor_color]
@@ -509,6 +665,8 @@ def try_find_config_file(brand, model):
 
 def get_tablet_dimensions_from_config(tablet_name):
     """Enhanced tablet detection with multiple fallback strategies"""
+    print(f"\n Searching for original tablet size section")
+    print(f" ==========================================")
     print(f"\n🔍 Detecting tablet: '{tablet_name}'")
     
     # Known brands list
@@ -768,22 +926,37 @@ def prompt_for_settings_selection():
             print("No file selected.")
             return None
 
-def try_get_tablet_info(settings):
-    # Try Devices first
+def try_get_tablet_info(settings, target_tablet=None):
+    # If a target_tablet is specified, look for it in Profiles
+    if target_tablet:
+        for profile in settings.get("Profiles", []):
+            name = profile.get("Tablet") or profile.get("Name") or profile.get("Model") or "Unknown"
+            if name == target_tablet:
+                abs_mode = profile.get("AbsoluteModeSettings")
+                if abs_mode and "Tablet" in abs_mode:
+                    tab = abs_mode["Tablet"]
+                    if all(key in tab for key in ["Width", "Height", "X", "Y"]):
+                        area = [tab["X"], tab["Y"], tab["X"] + tab["Width"], tab["Y"] + tab["Height"]]
+                        display = abs_mode.get("Display")
+                        return name, area, display, tab
+                        
+                # Fallback: try Area/Display at profile level
+                area = profile.get("Area")
+                display = profile.get("Display")
+                if area or display:
+                    return name, area, display, None
+    # Fallback: original logic
     for device in settings.get("Devices", []):
-        if "Area" in device:
-            area = device["Area"]
-            name = device.get("Tablet") or device.get("Name") or device.get("Model") or "Unknown"
+        area = device.get("Area")
+        name = device.get("Tablet") or device.get("Name") or device.get("Model") or "Unknown"
+        if area:
             return name, area, None, None
-    # Try Profiles
     for profile in settings.get("Profiles", []):
         name = profile.get("Tablet") or profile.get("Name") or profile.get("Model") or "Unknown"
         area = profile.get("Area")
         display = profile.get("Display")
-        # Prefer direct Area/Display if present
         if area or display:
             return name, area, display, None
-        # Otherwise, look for AbsoluteModeSettings at the same level as Filters
         abs_mode = profile.get("AbsoluteModeSettings")
         if abs_mode:
             abs_tablet = abs_mode.get("Tablet")
@@ -826,81 +999,189 @@ except ImportError:
     except:
         pass
 
-if not settings_path:
-    print("No settings file available. Using default values.")
-    tablet_name = "Unknown"
-    tablet_width = 216
-    tablet_height = 135
+detector = OTDTabletDetector()
+use_settings_json = False
+found_tablet = False
+
+if detector.check_otd_installation():
+    if detector.start_daemon():
+        timeout_seconds = 3
+        start_time = time.time()
+
+        while time.time() - start_time < timeout_seconds:
+            if detector.daemon_process and detector.daemon_process.stdout:
+                line = detector.daemon_process.stdout.readline()
+                if line:
+                    print(line, end="")
+                    if "Found tablet" in line:
+                        detector.detected_tablet_info = line.strip()
+                        found_tablet = True
+                        break
+            else:
+                time.sleep(0.1)
+
+        detector.stop_daemon()
+
+        if found_tablet:
+            if detector.detected_tablet_info is not None:
+                match = re.search(r"Found tablet '(.+)'", detector.detected_tablet_info)
+            else:
+                match = None
+            print(f"Detected tablet info: {detector.detected_tablet_info}")
+            if match:
+                tablet_name = match.group(1)
+                target_tablet = tablet_name
+
+                print(f"Detected tablet: {tablet_name}")
+
+                show_message(f"Tablet found: {tablet_name}", 2000)
+
+
+                print(f"\nReading settings from: {settings_path}")
+
+                if settings_path is None or not os.path.isfile(settings_path):
+                    print("✗ No valid settings file found. Using default values.")
+                    tablet_name = "Unknown"
+                    tablet_width = 216
+                    tablet_height = 135
+                else:
+                    try:
+                        with open(settings_path, "r", encoding="utf-8") as f:
+                            settings = json.load(f)
+
+                        tablet_name, area, display, abs_tablet = try_get_tablet_info(settings, target_tablet=target_tablet)
+
+                        # Update active_area_values from area or abs_tablet
+                        if area:
+                            tablet_width = area[2] - area[0]
+                            tablet_height = area[3] - area[1]
+                            print(f"Tablet area: {area}")
+                            # Update active area values
+                            active_area_x = area[0]
+                            active_area_y = area[1]
+                            active_area_width = tablet_width
+                            active_area_height = tablet_height
+                            active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]
+                        elif abs_tablet:
+                            tablet_width = abs_tablet.get("Width")
+                            tablet_height = abs_tablet.get("Height")
+                            print(f"Tablet (from AbsoluteModeSettings): {abs_tablet}")
+                            # Update active area values
+                            active_area_x = abs_tablet.get("X", 0)
+                            active_area_y = abs_tablet.get("Y", 0)
+                            active_area_width = abs_tablet.get("Width", 216)
+                            active_area_height = abs_tablet.get("Height", 135)
+                            active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]
+                        else:
+                            print("Tablet area not found, using default size.")
+                            tablet_width = 216
+                            tablet_height = 135
+
+                        # Active area extract
+                        active_area_found = False
+                        
+                        for profile in settings.get("Profiles", []):
+                            if profile.get("Tablet") == target_tablet:
+                                abs_mode = profile.get("AbsoluteModeSettings")
+                                if abs_mode and "Tablet" in abs_mode:
+                                    tab = abs_mode["Tablet"]
+                                    if all(key in tab for key in ["Width", "Height", "X", "Y"]):
+                                        
+                                        active_area_found = True
+                                        active_area_x = tab['X']
+                                        active_area_y = tab['Y']
+                                        active_area_width = tab['Width']
+                                        active_area_height = tab['Height']
+                                        active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]
+
+                                        break
+                        else:
+                            print(f"Nyaa~ {target_tablet} not found in profiles (；´д｀)ゞ")
+
+                        if not active_area_found:
+                            print("Active area not found in settings.")
+
+                        if display:
+                            display_width = display.get("Width")
+                            display_height = display.get("Height")
+                            print(f"Display width: {display_width}, height: {display_height}")
+
+                    except Exception as e:
+                        print(f"Failed to read OpenTabletDriver area: {e}")
+                        tablet_name = "Unknown"
+                        tablet_width = 216
+                        tablet_height = 135
+            else:
+                print("Could not extract tablet name. Fallback to settings.")
+                use_settings_json = True
+        else:
+            print("No tablet detected within timeout. Fallback to settings.")
+            use_settings_json = True
+    else:
+        print("Daemon failed to start. Fallback to settings.")
+        use_settings_json = True
 else:
+    print("OTD daemon not found. Fallback to settings.")
+    use_settings_json = True
+
+if use_settings_json:
     print(f"Reading settings from: {settings_path}")
-    try:
-        with open(settings_path, "r") as f:
-            settings = json.load(f)
-        tablet_name, area, display, abs_tablet = try_get_tablet_info(settings)
-        if area:
-            tablet_width = area[2] - area[0]
-            tablet_height = area[3] - area[1]
-            print(f"Tablet area: {area}")
-            print(f"Tablet width: {tablet_width}, Tablet height: {tablet_height}")
-        elif abs_tablet:
-            tablet_width = abs_tablet.get("Width")
-            tablet_height = abs_tablet.get("Height")
-            print(f"Tablet (from AbsoluteModeSettings): {abs_tablet}")
-            print(f"Tablet width: {tablet_width}, Tablet height: {tablet_height}")
-        else:
-            print("Tablet area not found, using default size.")
 
-        # Extract and display active area from AbsoluteModeSettings
-        active_area_found = False
-        for profile in settings.get("Profiles", []):
-            abs_mode = profile.get("AbsoluteModeSettings")
-            if abs_mode and "Tablet" in abs_mode:
-                tab = abs_mode["Tablet"]
-                if all(k in tab for k in ("Width", "Height", "X", "Y")):
-                    active_area_x = tab["X"]
-                    active_area_y = tab["Y"]
-                    active_area_width = tab["Width"]
-                    active_area_height = tab["Height"]
-                    print(f"Active Area: X={active_area_x}, Y={active_area_y}, Width={active_area_width}, Height={active_area_height}")
-                    active_area_found = True
-                    break
-        
-        if not active_area_found:
-            print("Active area (AbsoluteModeSettings.Tablet) not found in settings.")
-
-        if display:
-            display_width = display.get("Width")
-            display_height = display.get("Height")
-            print(f"Display: {display}")
-            print(f"Display width: {display_width}, Display height: {display_height}")
-        elif abs_tablet:
-            print("Display area not found, but AbsoluteModeSettings Tablet found.")
-        else:
-            print("Display area not found.")
-    except Exception as e:
-        print(f"Failed to read OpenTabletDriver area: {e}")
+    if settings_path is None or not os.path.isfile(settings_path):
+        print("✗ No valid settings file found. Using default values.")
         tablet_name = "Unknown"
         tablet_width = 216
         tablet_height = 135
+    else:
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            
+            tablet_name, area, display, abs_tablet = try_get_tablet_info(settings)
+
+            if area:
+                tablet_width = area[2] - area[0]
+                tablet_height = area[3] - area[1]
+                print(f"Tablet area: {area}")
+            elif abs_tablet:
+                tablet_width = abs_tablet.get("Width")
+                tablet_height = abs_tablet.get("Height")
+                print(f"Tablet (from AbsoluteModeSettings): {abs_tablet}")
+            else:
+                print("Tablet area not found, using default size.")
+                tablet_width = 216
+                tablet_height = 135
+
+            if display:
+                display_width = display.get("Width")
+                display_height = display.get("Height")
+                print(f"Display width: {display_width}, height: {display_height}")
+
+        except Exception as e:
+            print(f"Failed to read OpenTabletDriver area: {e}")
+            tablet_name = "Unknown"
+            tablet_width = 216
+            tablet_height = 135
 
 # After tablet_name is detected, add this logic:
-print(f"Final tablet model/name: {tablet_name}", flush=True)
+print(f"\nFinal tablet model/name: {target_tablet}", flush=True)
 # Separate brand and model
-parts = tablet_name.split()
+parts = target_tablet.split()
 if len(parts) >= 2:
     brand = parts[0]
     model = ' '.join(parts[1:])
     print(f"Brand: {brand}, Model: {model}", flush=True)
     # Load dimensions from config
-    tablet_width, tablet_height = get_tablet_dimensions_from_config(tablet_name)
+    tablet_width, tablet_height = get_tablet_dimensions_from_config(target_tablet)
     if tablet_width is None or tablet_height is None:
         print("Using default tablet size (216x135)")
         tablet_width, tablet_height = 216, 135
 else:
-    print(f"Tablet name '{tablet_name}' is not in expected 'Brand Model' format.")
+    print(f"Tablet name '{target_tablet}' is not in expected 'Brand Model' format.")
     tablet_width, tablet_height = 216, 135
 
-print(f"Final tablet width: {tablet_width}, height: {tablet_height}", flush=True)
+print(f"\n=== Final Data Display ===")
+print(f"\nFinal tablet width: {tablet_width}, height: {tablet_height}", flush=True)
 if display_width is not None and display_height is not None:
     print(f"Final display width: {display_width}, height: {display_height}", flush=True)
 else:
@@ -917,7 +1198,7 @@ active_area_values = [active_area_x, active_area_y, active_area_width, active_ar
 if active_area_values[2] == 216 and active_area_values[3] == 135:
     print("[HINT] Active area is set to default (no settings found).", flush=True)
 
-print(f"Active area width: {active_area_values[2]}, height: {active_area_values[3]}", flush=True)
+print(f"Final Active area width: {active_area_values[2]}, height: {active_area_values[3]}", flush=True)
 
 #Trail Length Slider
 SLIDER_COLOR = (80, 80, 80)
@@ -945,6 +1226,7 @@ current_thickness = 2  # Default thickness
 
 def get_active_area_bounds():
     """Get the current active area bounds"""
+    
     return {
         'left': active_area_values[0],
         'top': active_area_values[1], 
@@ -1106,7 +1388,7 @@ def load_settings(filepath=None, manual_load=False):
                 # Automatic load: try to load the last used file first
                 last_path = get_last_used_settings_path()
                 if last_path and os.path.isfile(last_path):
-                    print(f"Loading last used settings: {last_path}")
+                    print(f"\nLoading last used settings: {last_path}")
                     filepath = last_path
                 else:
                     # Show file dialog if no last used file
@@ -1268,12 +1550,7 @@ def reset_to_defaults():
         print("Reset cancelled by user")
         return False
 
-def show_message(message, duration=500):
-    message_surface = font.render(message, True, BUTTON_TEXT_COLOR)
-    message_rect = message_surface.get_rect(center=(WIN_WIDTH//2, WIN_HEIGHT - 100))
-    screen.blit(message_surface, message_rect)
-    pygame.display.update()
-    pygame.time.wait(duration)
+
 
 def draw_grid(surface, width, height, spacing, color):
     for x in range(0, width, spacing):
@@ -1674,6 +1951,27 @@ def deactivate_all_inputs():
     rectangle_hex_input_active = False
     background_hex_input_active = False
 
+def get_active_area_from_settings(settings, target_model=None):
+    """
+    Returns (tablet_name, area, display, abs_tablet) for the matching model.
+    area: [x, y, x+width, y+height] if AbsoluteModeSettings.Tablet is found.
+    abs_tablet: the dict with Width, Height, X, Y.
+    """
+    for profile in settings.get("Profiles", []):
+        name = profile.get("Tablet") or profile.get("Name") or profile.get("Model") or "Unknown"
+        if target_model and name != target_model:
+            continue
+        abs_mode = profile.get("AbsoluteModeSettings")
+        if abs_mode and "Tablet" in abs_mode:
+            tab = abs_mode["Tablet"]
+            if all(k in tab for k in ("Width", "Height", "X", "Y")):
+                # Compose area as [x, y, x+width, y+height]
+                area = [tab["X"], tab["Y"], tab["X"] + tab["Width"], tab["Y"] + tab["Height"]]
+                display = abs_mode.get("Display")
+                return name, area, display, tab
+    # Fallback to old logic if not found
+    return try_get_tablet_info(settings)
+
 # Main game loop
 while running:
     screen.fill(BACKGROUND_COLOR)
@@ -1734,8 +2032,12 @@ while running:
         trail.pop(0)
 
     mouse_pos = pygame.mouse.get_pos()
-
+    active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]
+    #print(f"BEFORE SETTINGS SHOWS: {active_area_values}")
+    #print(f"Active Areaadddddddddddddddd: {active_area_values}")
     if settings_open:
+        #print("DEBUG: active_area_values before draw:", active_area_values)
+        #break
         # Hide mini screen when settings are open (regardless of toggle)
         mini_visible = False
         
@@ -2019,7 +2321,7 @@ while running:
         
         # Section 5: Active Area (bottom left)
         y_offset = 420
-        section_title = font.render("Active Area (mm)", True, BUTTON_TEXT_COLOR)
+        section_title = font.render("Active Area (mm) (not available)", True, BUTTON_TEXT_COLOR)
         screen.blit(section_title, (left_margin, y_offset))
         
         # First row: Width, Height
@@ -2028,6 +2330,7 @@ while running:
             active_area_inputs[i+2].x = left_margin + 60 + i * 180  # Width (index 2), Height (index 3)
             active_area_inputs[i+2].y = y_offset + 30
             is_active = active_input == f"active_{i+2}"
+            #print(f"IF BOX ON WIDTH HEIGH: Width: {active_area_values[2]}, Height: {active_area_values[3]}, Box: {active_area_values[0]}, {active_area_values[1]}, Value: {active_area_values}")
             draw_input_box(active_area_inputs[i+2], active_area_values[i+2], is_active, labels_row1[i])
         
         # Second row: X, Y
@@ -2037,8 +2340,6 @@ while running:
             active_area_inputs[i].y = y_offset + 70
             is_active = active_input == f"active_{i}"
             draw_input_box(active_area_inputs[i], active_area_values[i], is_active, labels_row2[i])
-        
-
         
         # Draw protection shield overlay if active area is locked
         if active_area_locked:
@@ -2064,6 +2365,21 @@ while running:
             unlock_surface = font.render(unlock_text, True, (150, 150, 150))
             unlock_rect = unlock_surface.get_rect(centerx=shield_rect.centerx, y=shield_rect.centery + 15)
             screen.blit(unlock_surface, unlock_rect)
+            
+            # Check for hover and show tooltip
+            mouse_pos = pygame.mouse.get_pos()
+            if shield_rect.collidepoint(mouse_pos):
+                tooltip_text = "⚠️ WARNING: Changing active area may break tablet functionality!"
+                tooltip_surface = font.render(tooltip_text, True, (255, 200, 200))
+                tooltip_rect = tooltip_surface.get_rect()
+                tooltip_rect.topleft = (shield_rect.x, shield_rect.y - 40)
+                
+                # Draw tooltip background
+                tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
+                                       tooltip_rect.width + 10, tooltip_rect.height + 4)
+                pygame.draw.rect(screen, (60, 40, 40), tooltip_bg)
+                pygame.draw.rect(screen, (200, 100, 100), tooltip_bg, 1)
+                screen.blit(tooltip_surface, tooltip_rect)
             
             # Check for hover and show tooltip
             mouse_pos = pygame.mouse.get_pos()
@@ -2146,11 +2462,12 @@ while running:
             button_hover = button_rect.collidepoint(mouse_pos)
             draw_button(screen, "Settings", button_rect, button_hover)
 
-    # Handle active area unlock timeout (reset clicks if too much time passes)
+    # This goes in your main update loop, not inside event loop!
     if active_area_locked and active_area_unlock_clicks > 0:
         current_time = pygame.time.get_ticks()
         if current_time - active_area_unlock_timer > 3000:  # 3 seconds timeout
-            active_area_unlock_clicks = 0
+            active_area_unlock_clicks = 0  # ❗ Reset if too slow
+
     
     # Always update and draw mini display if enabled
     if mini_visible and not hide_minimap:
@@ -2384,6 +2701,22 @@ while running:
                                 input_text = str(active_area_values[i])
                                 input_clicked = True
                                 break
+                    
+                    # Check for protection shield clicks
+                    if not input_clicked and active_area_locked:
+                        # Check if click is in the active area section
+                        shield_rect = pygame.Rect(left_margin - 10, 420 - 10, 400, 120)
+                        if shield_rect.collidepoint(event.pos):
+                            active_area_unlock_clicks += 1
+                            active_area_unlock_timer = pygame.time.get_ticks()
+                            
+                            # Check if 3 clicks reached
+                            if active_area_unlock_clicks >= 3:
+                                active_area_locked = False
+                                active_area_unlock_clicks = 0
+                                show_message("Active area unlocked! Use with caution.", 2000)
+                            else:
+                                show_message(f"Click {3 - active_area_unlock_clicks} more times to unlock", 1000)
                     # If no input box was clicked, clear all inputs
                     if not input_clicked:
                         deactivate_all_inputs()
