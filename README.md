@@ -1,6 +1,9 @@
-# Cursor Tracker 
- 
-A Python-based cursor tracking tool designed for OpenTabletDriver users. This application provides real-time cursor visualization with customizable trails, colors, and tablet area mapping. 
+# Cursor Tracker – Python Cursor Tracking Tool for Tablets & OBS
+
+Cursor Tracker is a Python-based desktop utility for **real-time cursor visualization**, designed for **OpenTabletDriver** users.  
+It features **customizable trails, colors, tablet area mapping, and OBS overlay support**, making it perfect for **digital artists, streamers, and educators**.  
+
+With automatic tablet detection and full OpenTabletDriver integration, setup is simple—just run and start tracking!
  
 ## Features 
  
@@ -39,7 +42,13 @@ pyinstaller --onefile --console ^
 --add-data "opentabletdriver.customdaemon.exe;." ^
 --name "CursorTracker" cursortracker.py
 ``` 
- 
+
+## Use Cases
+- 🎨 Digital artists who want to visualize their pen movement
+- 🎥 Streamers who want cursor trails in OBS overlays
+- 🖱️ Developers testing cursor & input tracking
+- 📊 Educators making tutorials with live cursor visualization
+
 ## Usage 
  
 ### Running the Application 
