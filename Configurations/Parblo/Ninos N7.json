@@ -9,9 +9,7 @@
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 0
-      }
+      "ButtonCount": 0
     }
   },
   "DigitizerIdentifiers": [
@@ -37,6 +35,7 @@
     }
   ],
   "Attributes": {
-    "libinputoverride": "1"
+    "libinputoverride": "1",
+    "VerifiedLPI": "3600"
   }
 }

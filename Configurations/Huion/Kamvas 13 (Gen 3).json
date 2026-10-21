@@ -9,20 +9,28 @@
     },
     "Pen": {
       "MaxPressure": 16383,
-      "Buttons": {
-        "ButtonCount": 3
-      }
+      "ButtonCount": 3
     },
     "AuxiliaryButtons": {
       "ButtonCount": 7
-    }
+    },
+    "Wheels": [
+      {
+        "RelativeWheelSteps": 24,
+        "ButtonCount": 0
+      },
+      {
+        "RelativeWheelSteps": 24,
+        "ButtonCount": 0
+      }
+    ]
   },
   "DigitizerIdentifiers": [
     {
       "VendorID": 9580,
       "ProductID": 8200,
       "InputReportLength": 14,
-      "ReportParser": "OpenTabletDriver.Configurations.Parsers.UCLogic.UCLogicTiltReportParser",
+      "ReportParser": "OpenTabletDriver.Configurations.Parsers.Huion.GianoReportParser",
       "DeviceStrings": {
         "201": "HUION_M22c_\\d{6}$"
       },

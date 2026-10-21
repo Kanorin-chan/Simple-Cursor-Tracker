@@ -2,16 +2,14 @@
   "Name": "Huion H420",
   "Specifications": {
     "Digitizer": {
-      "Width": 101.6,
-      "Height": 57.01295,
+      "Width": 105.918,
+      "Height": 59.436,
       "MaxX": 8340,
       "MaxY": 4680
     },
     "Pen": {
       "MaxPressure": 2047,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     },
     "AuxiliaryButtons": {
       "ButtonCount": 3

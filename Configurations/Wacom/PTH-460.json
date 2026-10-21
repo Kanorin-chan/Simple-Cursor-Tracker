@@ -9,13 +9,18 @@
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     },
     "AuxiliaryButtons": {
       "ButtonCount": 6
-    }
+    },
+    "Wheels": [
+      {
+        "AbsoluteWheelMax": 71,
+        "AngleOfZeroReading": 90.0,
+        "ButtonCount": 1
+      }
+    ]
   },
   "DigitizerIdentifiers": [
     {
@@ -52,7 +57,7 @@
       ]
     }
   ],
-  "AuxilaryDeviceIdentifiers": [
+  "AuxiliaryDeviceIdentifiers": [
     {
       "VendorID": 1386,
       "ProductID": 914,

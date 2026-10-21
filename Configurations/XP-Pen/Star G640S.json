@@ -2,16 +2,14 @@
   "Name": "XP-Pen Star G640S",
   "Specifications": {
     "Digitizer": {
-      "Width": 165,
-      "Height": 103,
+      "Width": 164.995,
+      "Height": 102.995,
       "MaxX": 32999,
       "MaxY": 20599
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     },
     "AuxiliaryButtons": {
       "ButtonCount": 6

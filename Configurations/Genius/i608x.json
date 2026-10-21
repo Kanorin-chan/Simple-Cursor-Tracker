@@ -2,16 +2,14 @@
   "Name": "Genius i608x",
   "Specifications": {
     "Digitizer": {
-      "Width": 203.2,
-      "Height": 152.4,
+      "Width": 204.8,
+      "Height": 153.6,
       "MaxX": 40960,
       "MaxY": 30720
     },
     "Pen": {
       "MaxPressure": 2047,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     },
     "MouseButtons": {
       "ButtonCount": 3

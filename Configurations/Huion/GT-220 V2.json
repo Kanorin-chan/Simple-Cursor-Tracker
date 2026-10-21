@@ -9,9 +9,7 @@
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     }
   },
   "DigitizerIdentifiers": [
@@ -25,7 +23,10 @@
       },
       "InitializationStrings": [
         200
-      ]
+      ],
+      "Attributes": {
+        "Interface": "1"
+      }
     }
   ],
   "Attributes": {

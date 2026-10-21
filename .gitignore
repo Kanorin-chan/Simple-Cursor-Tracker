@@ -7,6 +7,8 @@ cursor_settings.json
 build/
 dist/
 *.spec
+!CursorTracker.spec
+.buildenv/
 __pycache__/
 
 # Local tooling

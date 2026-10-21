@@ -2,16 +2,14 @@
   "Name": "Parblo A640",
   "Specifications": {
     "Digitizer": {
-      "Width": 155,
-      "Height": 93,
+      "Width": 148.08,
+      "Height": 85.85,
       "MaxX": 29616,
       "MaxY": 17170
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     }
   },
   "DigitizerIdentifiers": [

@@ -1,5 +1,1 @@
 pygame>=2.5
-pyautogui
-numpy
-psutil
-pywin32; sys_platform == "win32"

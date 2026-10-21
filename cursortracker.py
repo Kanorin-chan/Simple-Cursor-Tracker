@@ -1,6 +1,6 @@
 import pygame
-import pyautogui
-import numpy as np
+import ctypes
+from ctypes import wintypes
 import json
 from pathlib import Path
 from tkinter import filedialog
@@ -13,9 +13,70 @@ from tkinter import messagebox, filedialog
 import math
 import pygame.gfxdraw
 import argparse
-import psutil
 import threading
 import re
+from collections import deque
+
+user32 = ctypes.WinDLL("user32")
+kernel32 = ctypes.WinDLL("kernel32")
+
+# System DPI awareness before any window exists; every coordinate below assumes physical pixels
+user32.SetProcessDPIAware()
+
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowW.restype = wintypes.HWND
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260)]
+
+kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+
+_cursor_point = wintypes.POINT()
+
+def get_cursor_pos():
+    """Cursor position in physical screen pixels"""
+    user32.GetCursorPos(ctypes.byref(_cursor_point))
+    return _cursor_point.x, _cursor_point.y
+
+# Cursor sampler thread: ~1 kHz so fast strokes keep their shape; the main loop drains it each frame
+cursor_samples = deque(maxlen=2048)  # (perf_counter time, x, y), only when the cursor moved
+sampler_stop = threading.Event()
+
+def sample_cursor():
+    """Poll the cursor every 1 ms (every 8 ms once it has been still for 0.5 s) and queue each change"""
+    last, moved, due = None, 0.0, time.perf_counter()
+    while not sampler_stop.is_set():
+        now = time.perf_counter()
+        pos = get_cursor_pos()
+        if pos != last:
+            last, moved = pos, now
+            cursor_samples.append((now, *pos))
+        # Fixed deadlines hold ~1 kHz; time.sleep uses a high-resolution timer since Python 3.11
+        due = max(due + (0.001 if now - moved < 0.5 else 0.008), now)
+        time.sleep(due - now)
+
+def focus_tracker_window():
+    """Bring the tracker window back to the front after a Tk dialog"""
+    try:
+        hwnd = user32.FindWindowW(None, "Simple Cursor Tracking")
+        if hwnd:
+            user32.SetForegroundWindow(hwnd)
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    except Exception:
+        pass
 
 # Now add the argument parsing
 parser = argparse.ArgumentParser(description='Cursor Tracking Tool')
@@ -24,10 +85,7 @@ args = parser.parse_args()
 
 # Hide console if not using -console flag and running as exe
 if not args.console and getattr(sys, 'frozen', False):
-    import ctypes
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-
-# Note: For better window focus management, install pywin32: pip install pywin32
 
 class OTDTabletDetector:
     def __init__(self, otd_path=None):
@@ -68,12 +126,19 @@ class OTDTabletDetector:
             return False
 
     def is_daemon_running(self):
-        for proc in psutil.process_iter(['name']):
-            try:
-                if proc.info['name'] and 'opentabletdriver.customdaemon' in proc.info['name'].lower():
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+            return False
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                if 'opentabletdriver.customdaemon' in entry.szExeFile.lower():
                     return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
+                ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
         return False
 
     def start_daemon(self) -> bool:
@@ -184,7 +249,17 @@ icon = pygame.image.load(icon_path)
 pygame.display.set_icon(icon)
 
 # Get screen size & set window size
-SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
+SCREEN_WIDTH, SCREEN_HEIGHT = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+# Virtual-desktop top-left = OTD's display origin; read per-monitor aware, as other-DPI monitors appear scaled here
+try:
+    user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    _dpi_context = user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+except AttributeError:
+    _dpi_context = None
+VIRTUAL_X, VIRTUAL_Y = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)  # SM_X/YVIRTUALSCREEN
+if _dpi_context:
+    user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(_dpi_context))
 WIN_WIDTH, WIN_HEIGHT = 800, 600
 SMALL_WIN_WIDTH, SMALL_WIN_HEIGHT = 200, 150  # Mini display
 
@@ -192,6 +267,18 @@ SMALL_WIN_WIDTH, SMALL_WIN_HEIGHT = 200, 150  # Mini display
 screen = pygame.display.set_mode((WIN_WIDTH, WIN_HEIGHT))
 small_screen = pygame.Surface((SMALL_WIN_WIDTH, SMALL_WIN_HEIGHT), pygame.SRCALPHA)
 pygame.display.set_caption("Simple Cursor Tracking")
+
+HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x2, 0x4, 0x10
+
+def window_handle():
+    """pygame's window; read it fresh, set_mode may replace it"""
+    return pygame.display.get_wm_info()["window"]
+
+def apply_always_on_top():
+    """Pin or unpin the window above others; set_mode drops the pin, so call it again after"""
+    user32.SetWindowPos(window_handle(), HWND_TOPMOST if always_on_top else HWND_NOTOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
 # Settings file
 SETTINGS_FILE = Path("cursor_settings.json")
@@ -212,13 +299,75 @@ MODAL_BG_COLOR = (30, 30, 30)  # Modal background
 
 # Trail settings
 trail = []
+trail_times = []  # perf_counter time of each trail point
 smooth_factor = 0.3
+TRAIL_STEP = 3  # px between kept trail points; the newest point always follows the cursor
 
 # Grid settings
 GRID_SPACING = 20  # Grid spacing
 
+# Tracking region: the part of the primary monitor the main view frames; osu! fields work like lazer's Screen scaling
+REGION_MODES = ("Full screen", "osu! game box", "osu! playfield")
+REGION_MODE_KEYS = ("full_screen", "osu_game_box", "osu_playfield")  # as saved in presets
+REGION_KEYS = ("region_position_x", "region_position_y", "region_scale_x", "region_scale_y", "pen_sensitivity")
+REGION_LABELS = ("Horizontal position", "Vertical position", "Horizontal scale", "Vertical scale", "Pen sensitivity")
+REGION_DEFAULTS = (50, 50, 100, 100, 1.0)
+REGION_LIMITS = ((0, 100), (0, 100), (20, 100), (20, 100), (0.1, 10))  # lazer's ranges
+REGION_COLOR = (255, 170, 0)  # the region's outline on the mini-map
+region_mode = 0
+region_values = list(REGION_DEFAULTS)  # position % (50 = centred), scale %, pen sensitivity
+region_inputs = [pygame.Rect(0, 0, 66, 22) for _ in range(5)]
+
+def tracking_region():
+    """(x, y, w, h) in cursor px: the primary monitor, lazer's Everything box on it, or the osu! playfield in that box"""
+    if region_mode == 0:
+        return 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT
+    pos_x, pos_y, size_x, size_y, sensitivity = [min(max(v, low), high) for v, (low, high) in zip(region_values, REGION_LIMITS)]
+    w, h = SCREEN_WIDTH * size_x / 100, SCREEN_HEIGHT * size_y / 100
+    x, y = (SCREEN_WIDTH - w) * pos_x / 100, (SCREEN_HEIGHT - h) * pos_y / 100
+    if region_mode == 1:
+        return x, y, w, h
+    # Playfield: 0.8 of the box fitted to 4:3, then 8 osu!px (of 512) lower
+    pw = min(w, h * 4 / 3) * 0.8
+    x, y, w, h = x + (w - pw) / 2, y + (h - pw * 3 / 4) / 2 + pw * 8 / 512, pw, pw * 3 / 4
+    # Pen sensitivity scales the game cursor about the monitor centre, so the cursor covers 1/sensitivity of the playfield
+    cx, cy = SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2
+    return cx + (x - cx) / sensitivity, cy + (y - cy) / sensitivity, w / sensitivity, h / sensitivity
+
+def region_fields():
+    """Indices of the region fields the mode uses, in reading order"""
+    return [4, 0, 1, 2, 3] if region_mode == 2 else [0, 1, 2, 3] if region_mode == 1 else []
+
+def fit_view():
+    """(scale, offset) fitting tracking_region() into the window: one scale for both axes, centred (letterboxed)"""
+    x, y, w, h = tracking_region()
+    scale = min(WIN_WIDTH / w, WIN_HEIGHT / h)
+    return scale, ((WIN_WIDTH - w * scale) / 2 - x * scale, (WIN_HEIGHT - h * scale) / 2 - y * scale)
+
+view_scale, view_offset = fit_view()
+
+def screen_to_view(x, y):
+    """Cursor pixel -> main-view pixel"""
+    return x * view_scale + view_offset[0], y * view_scale + view_offset[1]
+
+def view_rect():
+    """The tracking region in the main view; outside it are the letterbox bars"""
+    x, y, w, h = tracking_region()
+    left, top = screen_to_view(x, y)
+    return pygame.Rect(round(left), round(top), round(w * view_scale), round(h * view_scale)).clip(screen.get_rect())
+
+def set_view():
+    """Refit the view after a region change; the trail moves with it"""
+    global view_scale, view_offset, prev_x, prev_y, trail_target
+    old_scale, (old_x, old_y) = view_scale, view_offset
+    view_scale, view_offset = fit_view()
+    remap = lambda p: screen_to_view((p[0] - old_x) / old_scale, (p[1] - old_y) / old_scale)
+    trail[:] = [remap(p) for p in trail]
+    (prev_x, prev_y), trail_target = remap((prev_x, prev_y)), remap(trail_target)
+
 # Get initial position
-prev_x, prev_y = pyautogui.position()
+prev_x, prev_y = screen_to_view(*get_cursor_pos())
+trail_target, smooth_time = (prev_x, prev_y), time.perf_counter()  # where the smoothed point heads, and its time
 
 clock = pygame.time.Clock()
 running = True
@@ -232,6 +381,8 @@ small_screen.set_alpha(150)  # Semi-transparent
 # Settings button setup
 BUTTON_WIDTH, BUTTON_HEIGHT = 100, 40
 button_rect = pygame.Rect(10, WIN_HEIGHT - BUTTON_HEIGHT - 10, BUTTON_WIDTH, BUTTON_HEIGHT)
+minimap_rect = pygame.Rect(WIN_WIDTH - SMALL_WIN_WIDTH - 10, WIN_HEIGHT - SMALL_WIN_HEIGHT - 10, SMALL_WIN_WIDTH, SMALL_WIN_HEIGHT)
+window_drag = None  # Borderless drag: the grabbed point, from the window's top-left
 font = pygame.font.Font(None, 24)
 
 # Add these after your existing color definitions
@@ -254,6 +405,7 @@ error_message = ""
 active_area_locked = True
 active_area_unlock_clicks = 0
 active_area_unlock_timer = 0
+active_area_section = pygame.Rect(0, 0, 0, 0)  # Settings panel block, set where it's drawn; clicks here count toward unlocking
 
 # Active area rectangle styling
 active_area_color = (0, 255, 0)  # Default green color
@@ -267,6 +419,7 @@ color_picker_temp_values = [0, 0, 0]  # Temporary RGB values while picking
 color_picker_hue = 0
 color_picker_saturation = 100
 color_picker_value = 100
+color_wheel_cache = [None, None]  # [value it was drawn for, surface]
 
 # Color picker drag state
 color_picker_dragging = False
@@ -283,6 +436,9 @@ background_hex_input_active = False
 def show_message(message, duration=500):
     message_surface = font.render(message, True, BUTTON_TEXT_COLOR)
     message_rect = message_surface.get_rect(center=(WIN_WIDTH//2, WIN_HEIGHT - 100))
+    # Boxed like the tooltips, so it stays readable over the Settings fields
+    pygame.draw.rect(screen, (40, 40, 40), message_rect.inflate(20, 12))
+    pygame.draw.rect(screen, (100, 100, 100), message_rect.inflate(20, 12), 1)
     screen.blit(message_surface, message_rect)
     pygame.display.update()
     pygame.time.wait(duration)
@@ -357,7 +513,8 @@ def draw_color_picker_popup():
     pygame.draw.rect(screen, (100, 100, 100), popup_rect, 2)
     
     # Title
-    title_text = f"{color_picker_type.title() if color_picker_type else 'Color'} Color Picker"
+    picker_name = {"active_area": "Area"}.get(color_picker_type, (color_picker_type or "Color").title())
+    title_text = f"{picker_name} Color Picker"
     title_surface = font.render(title_text, True, BUTTON_TEXT_COLOR)
     title_rect = title_surface.get_rect(centerx=popup_x + popup_width//2, y=popup_y + 10)
     screen.blit(title_surface, title_rect)
@@ -367,26 +524,28 @@ def draw_color_picker_popup():
     wheel_center_y = popup_y + 120
     wheel_radius = 80
     
-    # Draw color wheel (simplified version)
-    for angle in range(0, 360, 5):
-        for radius in range(0, wheel_radius, 2):
-            h = angle
-            s = (radius / wheel_radius) * 100
-            v = color_picker_value
-            rgb = hsv_to_rgb(h, s, v)
-            
-            x = wheel_center_x + int(radius * np.cos(np.radians(angle)))
-            y = wheel_center_y + int(radius * np.sin(np.radians(angle)))
-            
-            if 0 <= x < WIN_WIDTH and 0 <= y < WIN_HEIGHT:
-                pygame.draw.circle(screen, rgb, (x, y), 1)
-    
+    # Draw color wheel (simplified version), re-rendered only when the value changes
+    if color_wheel_cache[0] != color_picker_value:
+        wheel_surface = pygame.Surface((wheel_radius * 2 + 2, wheel_radius * 2 + 2), pygame.SRCALPHA)
+        for angle in range(0, 360, 5):
+            for radius in range(0, wheel_radius, 2):
+                h = angle
+                s = (radius / wheel_radius) * 100
+                v = color_picker_value
+                rgb = hsv_to_rgb(h, s, v)
+
+                x = wheel_radius + 1 + int(radius * math.cos(math.radians(angle)))
+                y = wheel_radius + 1 + int(radius * math.sin(math.radians(angle)))
+                pygame.draw.circle(wheel_surface, rgb, (x, y), 1)
+        color_wheel_cache[:] = [color_picker_value, wheel_surface]
+    screen.blit(color_wheel_cache[1], (wheel_center_x - wheel_radius - 1, wheel_center_y - wheel_radius - 1))
+
     # Draw wheel border
     pygame.draw.circle(screen, (200, 200, 200), (wheel_center_x, wheel_center_y), wheel_radius, 2)
     
     # Draw current selection indicator on wheel
-    indicator_x = wheel_center_x + int((color_picker_saturation / 100) * wheel_radius * np.cos(np.radians(color_picker_hue)))
-    indicator_y = wheel_center_y + int((color_picker_saturation / 100) * wheel_radius * np.sin(np.radians(color_picker_hue)))
+    indicator_x = wheel_center_x + int((color_picker_saturation / 100) * wheel_radius * math.cos(math.radians(color_picker_hue)))
+    indicator_y = wheel_center_y + int((color_picker_saturation / 100) * wheel_radius * math.sin(math.radians(color_picker_hue)))
     
     # Use different colors for drag state
     if color_picker_dragging and color_picker_drag_type == "wheel":
@@ -571,8 +730,9 @@ active_area_x = 0
 active_area_y = 0
 active_area_width = 216  # Default fallback
 active_area_height = 135  # Default fallback
-active_area_inputs = [pygame.Rect(0, 0, 80, 30) for _ in range(4)]  # Added for active area input boxes
-active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]  # Ensure always defined
+active_area_rotation = 0
+active_area_inputs = [pygame.Rect(0, 0, 80, 30) for _ in range(5)]  # Added for active area input boxes
+active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height, active_area_rotation]  # Ensure always defined
 active_input = None
 # Ensure these are lists of int, not restricted types
 cursor_rgb_values = [int(c) for c in cursor_color]
@@ -607,6 +767,8 @@ enable_main_grid = False  # Main screen grid toggle
 enable_mini_grid = True  # Mini screen grid toggle
 enable_mini_screen = True  # Mini screen toggle
 trail_fade = True  # Trail fade toggle
+always_on_top = False  # Window stays above others
+minimap_zoom = False  # Mini-map frames the active area instead of the whole tablet
 
 def get_configuration_path():
     """Get the path to the Configuration folder, whether running as script or exe"""
@@ -973,31 +1135,20 @@ tablet_height = 135  # Default fallback
 tablet_name = "Unknown"
 display_width = None
 display_height = None
+display_x = None
+display_y = None
 # Active area from settings
 active_area_x = 0
 active_area_y = 0
 active_area_width = 216  # Default fallback
 active_area_height = 135  # Default fallback
+active_area_rotation = 0
 
 # Replace the settings loading logic with:
 settings_path = prompt_for_settings_selection()
 
 # Restore focus to Pygame window after initial settings selection
-try:
-    import win32gui
-    import win32con
-    # Find the Pygame window and bring it to front
-    hwnd = win32gui.FindWindow(None, "Simple Cursor Tracking")
-    if hwnd:
-        win32gui.SetForegroundWindow(hwnd)
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-except ImportError:
-    # If win32gui is not available, try alternative method
-    try:
-        pygame.display.set_caption("Simple Cursor Tracking")
-        pygame.display.update()
-    except:
-        pass
+focus_tracker_window()
 
 detector = OTDTabletDetector()
 use_settings_json = False
@@ -1071,7 +1222,7 @@ if detector.check_otd_installation():
                             active_area_y = abs_tablet.get("Y", 0)
                             active_area_width = abs_tablet.get("Width", 216)
                             active_area_height = abs_tablet.get("Height", 135)
-                            active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]
+                            active_area_rotation = abs_tablet.get("Rotation", 0)
                         else:
                             print("Tablet area not found, using default size.")
                             tablet_width = 216
@@ -1092,7 +1243,7 @@ if detector.check_otd_installation():
                                         active_area_y = tab['Y']
                                         active_area_width = tab['Width']
                                         active_area_height = tab['Height']
-                                        active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]
+                                        active_area_rotation = tab.get('Rotation', 0)
 
                                         break
                         else:
@@ -1104,7 +1255,8 @@ if detector.check_otd_installation():
                         if display:
                             display_width = display.get("Width")
                             display_height = display.get("Height")
-                            print(f"Display width: {display_width}, height: {display_height}")
+                            display_x, display_y = display.get("X"), display.get("Y")
+                            print(f"Display width: {display_width}, height: {display_height}, centre: {display_x}, {display_y}")
 
                     except Exception as e:
                         print(f"Failed to read OpenTabletDriver area: {e}")
@@ -1147,6 +1299,10 @@ if use_settings_json:
                 tablet_width = abs_tablet.get("Width")
                 tablet_height = abs_tablet.get("Height")
                 print(f"Tablet (from AbsoluteModeSettings): {abs_tablet}")
+                if all(key in abs_tablet for key in ["Width", "Height", "X", "Y"]):
+                    active_area_x, active_area_y = abs_tablet["X"], abs_tablet["Y"]
+                    active_area_width, active_area_height = abs_tablet["Width"], abs_tablet["Height"]
+                    active_area_rotation = abs_tablet.get("Rotation", 0)
             else:
                 print("Tablet area not found, using default size.")
                 tablet_width = 216
@@ -1155,13 +1311,17 @@ if use_settings_json:
             if display:
                 display_width = display.get("Width")
                 display_height = display.get("Height")
-                print(f"Display width: {display_width}, height: {display_height}")
+                display_x, display_y = display.get("X"), display.get("Y")
+                print(f"Display width: {display_width}, height: {display_height}, centre: {display_x}, {display_y}")
 
         except Exception as e:
             print(f"Failed to read OpenTabletDriver area: {e}")
             tablet_name = "Unknown"
             tablet_width = 216
             tablet_height = 135
+
+    # No tablet from the daemon: continue with the name Settings.json gave
+    target_tablet = tablet_name
 
 # After tablet_name is detected, add this logic:
 print(f"\nFinal tablet model/name: {target_tablet}", flush=True)
@@ -1182,23 +1342,29 @@ else:
 
 print(f"\n=== Final Data Display ===")
 print(f"\nFinal tablet width: {tablet_width}, height: {tablet_height}", flush=True)
-if display_width is not None and display_height is not None:
-    print(f"Final display width: {display_width}, height: {display_height}", flush=True)
+# OTD's display area as (centre x, centre y, width, height) in cursor pixels; X/Y count from the virtual-desktop top-left
+if None in (display_x, display_y) or not (display_width and display_height):
+    print("[HINT] Display area not found in settings. Mapping to the primary monitor.", flush=True)
+    display_area = (SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT)
 else:
-    print("[HINT] Display area not found in settings.", flush=True)
+    display_area = (display_x + VIRTUAL_X, display_y + VIRTUAL_Y, display_width, display_height)
+print(f"Final display area (centre x, centre y, width, height on screen): {display_area}", flush=True)
 
 if tablet_width == 216 and tablet_height == 135:
     print("[HINT] Tablet area not found in settings. Using default tablet area (216x135).", flush=True)
 
-# Active Area Input Boxes - these now represent the ACTIVE area from settings
-active_area_inputs = [pygame.Rect(0, 0, 80, 30) for _ in range(4)]
-# Use active area values from settings as defaults
-active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]  # [left, top, width, height]
-
-if active_area_values[2] == 216 and active_area_values[3] == 135:
+# No area in Settings.json: OTD's default, the whole tablet
+if (active_area_x, active_area_y, active_area_width, active_area_height) == (0, 0, 216, 135):
     print("[HINT] Active area is set to default (no settings found).", flush=True)
+    active_area_x, active_area_y = tablet_width / 2, tablet_height / 2
+    active_area_width, active_area_height = tablet_width, tablet_height
 
-print(f"Final Active area width: {active_area_values[2]}, height: {active_area_values[3]}", flush=True)
+# Active Area Input Boxes - these now represent the ACTIVE area from settings
+active_area_inputs = [pygame.Rect(0, 0, 80, 30) for _ in range(5)]
+# OTD's convention: X/Y are the area's centre, rotation in degrees
+active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height, active_area_rotation]
+
+print(f"Final Active area (centre x, centre y, width, height, rotation): {active_area_values}", flush=True)
 
 #Trail Length Slider
 SLIDER_COLOR = (80, 80, 80)
@@ -1224,15 +1390,26 @@ min_thickness = 1
 max_thickness = 10
 current_thickness = 2  # Default thickness
 
-def get_active_area_bounds():
-    """Get the current active area bounds"""
-    
-    return {
-        'left': active_area_values[0],
-        'top': active_area_values[1], 
-        'width': active_area_values[2],
-        'height': active_area_values[3]
-    }
+# Active-area outline thickness slider (1-5)
+area_thickness_slider = pygame.Rect(0, 0, SLIDER_WIDTH, SLIDER_HEIGHT)
+
+def screen_to_tablet(x, y):
+    """Cursor pixel -> tablet mm, the inverse of OTD's AbsoluteOutputMode.CalculateTransformation.
+    OTD: minus area centre, rotate by -Rotation, scale area to display, plus display centre."""
+    area_x, area_y, area_w, area_h, rotation = active_area_values
+    centre_x, centre_y, display_w, display_h = display_area
+    u, v = (x - centre_x) * area_w / display_w, (y - centre_y) * area_h / display_h
+    a = math.radians(rotation)
+    return area_x + u * math.cos(a) - v * math.sin(a), area_y + u * math.sin(a) + v * math.cos(a)
+
+minimap_view = (0, 0, tablet_width, tablet_height)  # (x, y, w, h) mm the mini-map frames: tablet, or area when zoomed
+
+def tablet_to_minimap(mm_x, mm_y):
+    """Tablet mm -> mini-map pixel: one scale for both axes, minimap_view centred (letterboxed)"""
+    view_x, view_y, view_w, view_h = minimap_view
+    scale = min(SMALL_WIN_WIDTH / view_w, SMALL_WIN_HEIGHT / view_h)
+    return ((SMALL_WIN_WIDTH - view_w * scale) / 2 + (mm_x - view_x) * scale,
+            (SMALL_WIN_HEIGHT - view_h * scale) / 2 + (mm_y - view_y) * scale)
 
 def get_last_used_settings_path():
     """Load the path of the last used settings file."""
@@ -1283,9 +1460,14 @@ def save_settings():
         'active_area_top': active_area_values[1],
         'active_area_width': active_area_values[2],
         'active_area_height': active_area_values[3],
+        'active_area_rotation': active_area_values[4],
         'active_area_color': active_area_rgb_values,
         'active_area_thickness': active_area_thickness,
-        'background_color': background_rgb_values
+        'background_color': background_rgb_values,
+        'always_on_top': always_on_top,
+        'minimap_zoom': minimap_zoom,
+        'region_mode': REGION_MODE_KEYS[region_mode],
+        **dict(zip(REGION_KEYS, region_values))
     }
 
     # Show file dialog for save location
@@ -1309,21 +1491,7 @@ def save_settings():
     )
     
     # Restore focus to Pygame window after dialog
-    try:
-        import win32gui
-        import win32con
-        # Find the Pygame window and bring it to front
-        hwnd = win32gui.FindWindow(None, "Simple Cursor Tracking")
-        if hwnd:
-            win32gui.SetForegroundWindow(hwnd)
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    except ImportError:
-        # If win32gui is not available, try alternative method
-        try:
-            pygame.display.set_caption("Simple Cursor Tracking")
-            pygame.display.update()
-        except:
-            pass
+    focus_tracker_window()
 
     if filepath:
         try:
@@ -1345,7 +1513,7 @@ def load_settings(filepath=None, manual_load=False):
     global enable_trail, trail_fade, enable_main_grid, enable_mini_grid, enable_mini_screen
     global current_smooth, current_thickness, cursor_color, trail_color
     global active_area_values, active_area_rgb_values, active_area_color, active_area_thickness
-    global background_rgb_values, BACKGROUND_COLOR
+    global background_rgb_values, BACKGROUND_COLOR, always_on_top, minimap_zoom, region_mode
     try:
         # If no filepath provided, check if it's manual load or automatic load
         if filepath is None:
@@ -1369,63 +1537,16 @@ def load_settings(filepath=None, manual_load=False):
                 )
                 
                 # Restore focus to Pygame window after dialog
-                try:
-                    import win32gui
-                    import win32con
-                    # Find the Pygame window and bring it to front
-                    hwnd = win32gui.FindWindow(None, "Simple Cursor Tracking")
-                    if hwnd:
-                        win32gui.SetForegroundWindow(hwnd)
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                except ImportError:
-                    # If win32gui is not available, try alternative method
-                    try:
-                        pygame.display.set_caption("Simple Cursor Tracking")
-                        pygame.display.update()
-                    except:
-                        pass
+                focus_tracker_window()
             else:
-                # Automatic load: try to load the last used file first
+                # Automatic load: only the last used file, otherwise keep the defaults silently
                 last_path = get_last_used_settings_path()
-                if last_path and os.path.isfile(last_path):
-                    print(f"\nLoading last used settings: {last_path}")
-                    filepath = last_path
-                else:
-                    # Show file dialog if no last used file
-                    root = tk.Tk()
-                    root.withdraw()
-                    
-                    # Use exe directory as default location
-                    if getattr(sys, 'frozen', False):
-                        # Running as exe
-                        default_dir = os.path.dirname(sys.executable)
-                    else:
-                        # Running as script
-                        default_dir = os.path.dirname(os.path.abspath(__file__))
-                    
-                    filepath = filedialog.askopenfilename(
-                        title="Load Cursor Settings",
-                        filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-                        initialdir=default_dir
-                    )
-                    
-                    # Restore focus to Pygame window after dialog
-                    try:
-                        import win32gui
-                        import win32con
-                        # Find the Pygame window and bring it to front
-                        hwnd = win32gui.FindWindow(None, "Simple Cursor Tracking")
-                        if hwnd:
-                            win32gui.SetForegroundWindow(hwnd)
-                            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    except ImportError:
-                        # If win32gui is not available, try alternative method
-                        try:
-                            pygame.display.set_caption("Simple Cursor Tracking")
-                            pygame.display.update()
-                        except:
-                            pass
-        
+                if not (last_path and os.path.isfile(last_path)):
+                    print("No last used settings file. Using defaults.")
+                    return False
+                print(f"\nLoading last used settings: {last_path}")
+                filepath = last_path
+
         if filepath and os.path.isfile(filepath):  # Only load if file was selected and exists
             with open(filepath, 'r') as f:
                 settings = json.load(f)
@@ -1445,7 +1566,8 @@ def load_settings(filepath=None, manual_load=False):
                 active_area_values[1] = settings.get('active_area_top', active_area_values[1])
                 active_area_values[2] = settings.get('active_area_width', active_area_values[2])
                 active_area_values[3] = settings.get('active_area_height', active_area_values[3])
-                
+                active_area_values[4] = settings.get('active_area_rotation', 0)  # older presets have none
+
                 # Load active area styling
                 active_area_rgb_values = settings.get('active_area_color', active_area_rgb_values)
                 active_area_thickness = settings.get('active_area_thickness', active_area_thickness)
@@ -1453,7 +1575,18 @@ def load_settings(filepath=None, manual_load=False):
                 # Load background color
                 background_rgb_values = settings.get('background_color', background_rgb_values)
                 BACKGROUND_COLOR = tuple(background_rgb_values)
-                
+
+                # Optional keys: older presets lack them, so they mean off
+                always_on_top = settings.get('always_on_top', False)
+                minimap_zoom = settings.get('minimap_zoom', False)
+                apply_always_on_top()
+                # Tracking region, optional too: missing = full screen and lazer's neutral values
+                loaded_values = [float(settings.get(key, default)) for key, default in zip(REGION_KEYS, REGION_DEFAULTS)]
+                mode = settings.get('region_mode')
+                region_mode = REGION_MODE_KEYS.index(mode) if mode in REGION_MODE_KEYS else 0
+                region_values[:] = loaded_values
+                set_view()
+
                 # Update colors
                 cursor_color = tuple(cursor_rgb_values)
                 trail_color = tuple(trail_rgb_values)
@@ -1482,8 +1615,8 @@ def reset_to_defaults():
     global enable_trail, trail_fade, enable_main_grid, enable_mini_grid, enable_mini_screen
     global current_smooth, current_thickness, cursor_color, trail_color
     global active_area_values, active_area_rgb_values, active_area_color, active_area_thickness
-    global background_rgb_values, BACKGROUND_COLOR
-    
+    global background_rgb_values, BACKGROUND_COLOR, always_on_top, minimap_zoom, region_mode
+
     # Show confirmation dialog
     root = tk.Tk()
     root.withdraw()
@@ -1491,28 +1624,15 @@ def reset_to_defaults():
         "Reset to Defaults",
         "Are you sure you want to reset all settings to their default values?\n\n"
         "This will reset:\n"
-        "• Cursor color, trail color, rectangle color, background color\n"
-        "• Rectangle thickness, trail length, smoothness, thickness\n"
-        "• All checkboxes to their default states\n\n"
+        "• Cursor, trail, area and background colors\n"
+        "• Area thickness, trail length, follow speed and trail thickness\n"
+        "• All checkboxes except Borderless and Hide UI\n"
+        "• Tracking region (back to Full screen)\n\n"
         "This action cannot be undone."
     )
     
     # Restore focus to Pygame window after dialog
-    try:
-        import win32gui
-        import win32con
-        # Find the Pygame window and bring it to front
-        hwnd = win32gui.FindWindow(None, "Simple Cursor Tracking")
-        if hwnd:
-            win32gui.SetForegroundWindow(hwnd)
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    except ImportError:
-        # If win32gui is not available, try alternative method
-        try:
-            pygame.display.set_caption("Simple Cursor Tracking")
-            pygame.display.update()
-        except:
-            pass
+    focus_tracker_window()
     
     if result:
         # Reset colors to defaults
@@ -1539,7 +1659,13 @@ def reset_to_defaults():
         enable_main_grid = False     # Disable main grid
         enable_mini_grid = True      # Enable mini grid
         enable_mini_screen = True    # Enable mini screen
-        
+        minimap_zoom = False
+        always_on_top = False
+        apply_always_on_top()
+        region_mode = 0
+        region_values[:] = REGION_DEFAULTS
+        set_view()
+
         # Reset active area values to defaults (these will be calculated based on tablet dimensions)
         # The active area values are set dynamically based on tablet info, so we'll keep current values
         # but reset the styling
@@ -1568,9 +1694,21 @@ def draw_checkbox(x, y, text, checked):
     
     label = font.render(text, True, BUTTON_TEXT_COLOR)
     screen.blit(label, (x + checkbox_size + 10, y))
-    return checkbox_rect
+    return checkbox_rect.union(label.get_rect(topleft=(x + checkbox_size + 10, y)))  # the label clicks too
 
-def draw_button(screen, text, rect, hover):
+def draw_section_header(x, y, text, width=220):
+    """Settings section title with a rule under it"""
+    screen.blit(font.render(text, True, BUTTON_TEXT_COLOR), (x, y))
+    pygame.draw.line(screen, (70, 70, 70), (x, y + 20), (x + width, y + 20))
+
+def draw_button(screen, text, rect, hover, boxed=False):
+    if boxed:
+        # Settings panel: a bordered box, lighter while hovered
+        pygame.draw.rect(screen, INPUT_BOX_ACTIVE_COLOR if hover else INPUT_BOX_COLOR, rect)
+        pygame.draw.rect(screen, INPUT_BOX_ACTIVE_BORDER_COLOR if hover else INPUT_BOX_BORDER_COLOR, rect, 2)
+        button_text = font.render(text, True, BUTTON_TEXT_COLOR)
+        screen.blit(button_text, button_text.get_rect(center=rect.center))
+        return
     button_surface = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
     button_surface.fill(BUTTON_HOVER_COLOR if hover else BUTTON_COLOR)
     button_surface.set_alpha(150)
@@ -1582,24 +1720,27 @@ def draw_button(screen, text, rect, hover):
     screen.blit(button_surface, rect)
 
 def catmull_rom_spline(p0, p1, p2, p3, num_points=10):
-    """Generates a smooth Catmull-Rom spline through points."""
-    p0, p1, p2, p3 = map(np.array, [p0, p1, p2, p3])
-    t = np.linspace(0, 1, num_points)
-    t2 = t**2
-    t3 = t**3
-    basis = np.array([
-        -t3 + 2*t2 - t,
-        3*t3 - 5*t2 + 2,
-        -3*t3 + 4*t2 + t,
-        t3 - t2
-    ]).T * 0.5
-    result = basis @ np.vstack([p0, p1, p2, p3])
-    return result.astype(int)
+    """Points along the p1->p2 Catmull-Rom segment, excluding p1. Needs p1 != p2."""
+    # Tangents scaled to this segment's length, so uneven sample spacing can't overshoot
+    d12 = math.dist(p1, p2)
+    k1 = d12 / (math.dist(p0, p1) + d12)
+    k2 = d12 / (d12 + math.dist(p2, p3))
+    m1x, m1y = (p2[0] - p0[0]) * k1, (p2[1] - p0[1]) * k1
+    m2x, m2y = (p3[0] - p1[0]) * k2, (p3[1] - p1[1]) * k2
+    points = []
+    for j in range(1, num_points + 1):
+        t = j / num_points
+        t2 = t * t
+        t3 = t2 * t
+        h00, h10, h01, h11 = 2*t3 - 3*t2 + 1, t3 - 2*t2 + t, 3*t2 - 2*t3, t3 - t2
+        points.append((h00*p1[0] + h10*m1x + h01*p2[0] + h11*m2x,
+                       h00*p1[1] + h10*m1y + h01*p2[1] + h11*m2y))
+    return points
 
-def draw_input_box(rect, value, is_active, label_text="", placeholder=""):
+def draw_input_box(rect, value, is_active, label_text="", placeholder="", editable=True, tooltip="Click to edit"):
     """Draw a user-friendly input box with hover effects, borders, and cursor"""
     mouse_pos = pygame.mouse.get_pos()
-    is_hovered = rect.collidepoint(mouse_pos)
+    is_hovered = editable and rect.collidepoint(mouse_pos)
     
     # Determine box color based on state
     if is_active and input_error:
@@ -1652,20 +1793,20 @@ def draw_input_box(rect, value, is_active, label_text="", placeholder=""):
     text_x = rect.x + 8
     text_y = rect.y + (rect.height - text_surface.get_height()) // 2
     
-    # Clip text if it's too long
+    # Clip text if it's too long; while editing, show its end where the cursor is
     if text_surface.get_width() > rect.width - 16:
         # Create a clipped surface
         clipped_surface = pygame.Surface((rect.width - 16, text_surface.get_height()))
         clipped_surface.fill(box_color)
-        clipped_surface.blit(text_surface, (0, 0))
+        clipped_surface.blit(text_surface, (rect.width - 16 - text_surface.get_width() if is_active else 0, 0))
         screen.blit(clipped_surface, (text_x, text_y))
     else:
         screen.blit(text_surface, (text_x, text_y))
-    
+
     # Draw cursor if active
     if is_active:
         if input_text != "":
-            cursor_x = text_x + font.render(input_text, True, text_color).get_width()
+            cursor_x = text_x + min(font.render(input_text, True, text_color).get_width(), rect.width - 16)
         else:
             cursor_x = text_x  # Cursor at start when input is empty
         cursor_y = text_y
@@ -1677,13 +1818,12 @@ def draw_input_box(rect, value, is_active, label_text="", placeholder=""):
                            (cursor_x, cursor_y), 
                            (cursor_x, cursor_y + cursor_height), 2)
     
-    # Draw hover tooltip
+    # Draw hover tooltip, kept inside the window
     if is_hovered and not is_active:
-        tooltip_text = "Click to edit"
-        tooltip_surface = font.render(tooltip_text, True, (200, 200, 200))
+        tooltip_surface = font.render(tooltip, True, (200, 200, 200))
         tooltip_rect = tooltip_surface.get_rect()
-        tooltip_rect.topleft = (rect.x, rect.y - 25)
-        
+        tooltip_rect.topleft = (min(rect.x, WIN_WIDTH - tooltip_rect.width - 10), rect.y - 25)
+
         # Draw tooltip background
         tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
                                tooltip_rect.width + 10, tooltip_rect.height + 4)
@@ -1691,13 +1831,16 @@ def draw_input_box(rect, value, is_active, label_text="", placeholder=""):
         pygame.draw.rect(screen, (100, 100, 100), tooltip_bg, 1)
         screen.blit(tooltip_surface, tooltip_rect)
 
-def draw_color_section(y_offset, title, rgb_values, rgb_inputs, is_cursor=True, hex_input_active=False, hex_input_text="", hex_input_rect=None):
+def draw_color_section(x, y_offset, title, rgb_values, input_name):
+    """Label, a swatch that opens the picker, and a hex box; returns (swatch, hex box) rects"""
+    hex_input_active = active_input == input_name
+    hex_input_text = input_text if hex_input_active else ""
     # Draw section title
     section_title = font.render(title, True, BUTTON_TEXT_COLOR)
-    screen.blit(section_title, (50, y_offset))
-    
+    screen.blit(section_title, (x, y_offset))
+
     # Draw color preview (clickable)
-    preview_rect = pygame.Rect(50, y_offset + 25, 80, 40)
+    preview_rect = pygame.Rect(x, y_offset + 25, 80, 40)
     pygame.draw.rect(screen, rgb_values, preview_rect)
     pygame.draw.rect(screen, BUTTON_TEXT_COLOR, preview_rect, 2)  # Border
     
@@ -1801,9 +1944,9 @@ def draw_color_section(y_offset, title, rgb_values, rgb_inputs, is_cursor=True, 
     # Return preview_rect and input_rect for click detection
     return preview_rect, input_rect
 
-def draw_slider(x, y, width, value, min_val, max_val, label):
-    # Draw slider label
-    label_text = font.render(f"{label}: {value}", True, BUTTON_TEXT_COLOR)
+def draw_slider(x, y, width, value, min_val, max_val, label, shown=None, grabbed=False):
+    # Draw slider label; shown = the value as text, when it isn't the raw number
+    label_text = font.render(f"{label}: {value if shown is None else shown}", True, BUTTON_TEXT_COLOR)
     screen.blit(label_text, (x, y - 20))
     
     # Draw slider track
@@ -1816,7 +1959,7 @@ def draw_slider(x, y, width, value, min_val, max_val, label):
     
     # Highlight if mouse is over handle
     mouse_pos = pygame.mouse.get_pos()
-    if handle_rect.collidepoint(mouse_pos) or slider_grabbed:
+    if handle_rect.collidepoint(mouse_pos) or grabbed:
         pygame.draw.rect(screen, SLIDER_HOVER_COLOR, handle_rect)
     else:
         pygame.draw.rect(screen, BUTTON_TEXT_COLOR, handle_rect)
@@ -1854,6 +1997,15 @@ def set_borderless(enable):
     flags = pygame.NOFRAME if enable else 0
     pygame.display.set_mode((WIN_WIDTH, WIN_HEIGHT), flags)
     pygame.display.set_caption("Simple Cursor Tracking")
+    apply_always_on_top()
+
+def toggle_overlay_mode(hide_map):
+    """Alt menu 2/3 and the OBS checkboxes: hide the UI (and the mini-map), or undo that same mode"""
+    global hide_ui, hide_minimap
+    if hide_ui and hide_minimap == hide_map:
+        hide_ui = hide_minimap = False
+    else:
+        hide_ui, hide_minimap = True, hide_map
 
 # Tooltip overlay drawing
 def draw_tooltip_overlay():
@@ -1872,74 +2024,92 @@ def draw_tooltip_overlay():
     screen.blit(hint, (WIN_WIDTH//2 - hint.get_width()//2, 320))
 
 def draw_thick_line_with_caps(surface, color, start, end, thickness):
-    """Draw a thick line with rounded caps for smooth connections"""
-    if thickness <= 1:
-        pygame.draw.aaline(surface, color, start, end)
-        return
-    # Draw the main line
-    pygame.draw.line(surface, color, start, end, thickness)
-    # Draw rounded caps at both ends
-    radius = thickness // 2
-    pygame.draw.circle(surface, color, (int(start[0]), int(start[1])), radius)
-    pygame.draw.circle(surface, color, (int(end[0]), int(end[1])), radius)
+    """Draw a line of the same width at every angle, with a round cap at the end point"""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    half = thickness / 2
+    # pygame truncates float coordinates; +0.5 makes that rounding so the stroke stays centred
+    sx, sy, ex, ey = start[0] + 0.5, start[1] + 0.5, end[0] + 0.5, end[1] + 0.5
+    if length:
+        nx, ny = -dy / length * half, dx / length * half
+        pygame.draw.polygon(surface, color, [(sx + nx, sy + ny), (ex + nx, ey + ny), (ex - nx, ey - ny), (sx - nx, sy - ny)])
+    pygame.draw.circle(surface, color, (ex, ey), (thickness + 1) / 2)
 
-def ensure_trail_continuity(trail, max_gap_distance=10):
-    """Fill gaps in trail by interpolating missing points"""
-    if len(trail) < 2:
-        return trail
-    continuous_trail = [trail[0]]
-    for i in range(1, len(trail)):
-        prev_point = continuous_trail[-1]
-        current_point = trail[i]
-        dx = current_point[0] - prev_point[0]
-        dy = current_point[1] - prev_point[1]
-        distance = math.sqrt(dx*dx + dy*dy)
-        if distance > max_gap_distance:
-            num_interpolated = int(distance / max_gap_distance)
-            for j in range(1, num_interpolated + 1):
-                t = j / (num_interpolated + 1)
-                interpolated_x = prev_point[0] + dx * t
-                interpolated_y = prev_point[1] + dy * t
-                continuous_trail.append((interpolated_x, interpolated_y))
-        continuous_trail.append(current_point)
-    return continuous_trail
+def draw_dashed_line(surface, color, start, end, dash=3):
+    """1-px line of dash-px dashes and gaps"""
+    length = math.dist(start, end)
+    for i in range(0, math.ceil(length / dash), 2):
+        a, b = i * dash / length, min((i + 1) * dash / length, 1)
+        pygame.draw.line(surface, color, (round(start[0] + (end[0] - start[0]) * a), round(start[1] + (end[1] - start[1]) * a)),
+                         (round(start[0] + (end[0] - start[0]) * b), round(start[1] + (end[1] - start[1]) * b)))
 
-def render_trail(screen, trail, trail_color, current_thickness, enable_trail=True, trail_fade=True):
-    """
-    Updated trail rendering with comprehensive improvements
-    """
+def render_trail(screen, trail, trail_color, current_thickness, enable_trail=True, trail_fade=True, fades=None):
+    """Draw the trail as one Catmull-Rom smoothed stroke, fading from the background colour to trail_color.
+    fades: each point's level, 0 = background to 1 = trail_color; default evenly by index"""
     if not enable_trail or len(trail) < 2:
         return
-    # Ensure trail continuity
-    continuous_trail = ensure_trail_continuity(trail, max_gap_distance=10)
-    # Primary rendering: Draw lines between all consecutive points
-    for i in range(len(continuous_trail) - 1):
-        if trail_fade:
-            fade = i / len(continuous_trail)
-            current_color = [int(c * fade) for c in trail_color]
+    last = len(trail) - 1
+    if fades is None:
+        fades = [i / last for i in range(last + 1)]
+    if not trail_fade:
+        pygame.draw.circle(screen, trail_color, (trail[0][0] + 0.5, trail[0][1] + 0.5), (current_thickness + 1) / 2)
+    for i in range(last):
+        p1, p2 = trail[i], trail[i + 1]
+        segment_length = math.dist(p1, p2)
+        if segment_length == 0:
+            continue
+        p0 = trail[i - 1] if i > 0 else p1
+        p3 = trail[i + 2] if i + 2 <= last else p2
+        steps = max(1, min(12, int(segment_length / 6)))  # about one sample per 6 px
+        start = p1
+        for j, end in enumerate(catmull_rom_spline(p0, p1, p2, p3, steps) if steps > 1 else [p2], 1):  # 1 step ends at p2
+            if trail_fade:
+                fade = fades[i] + (fades[i + 1] - fades[i]) * (j - 0.5) / steps
+                current_color = [round(b + (c - b) * fade) for c, b in zip(trail_color, BACKGROUND_COLOR)]
+            else:
+                current_color = trail_color
+            draw_thick_line_with_caps(screen, current_color, start, end, current_thickness)
+            start = end
+
+def smooth_trail_to(t):
+    """Move the smoothed point toward trail_target until time t and record it in the trail"""
+    global prev_x, prev_y, smooth_time
+    t = max(t, smooth_time)  # a sample queued during the last drain can be older than the frame
+    dt, smooth_time = t - smooth_time, t
+    # Smoothness was a per-60 Hz-frame step; this time constant gives the same lag while moving
+    k = 1.0 if current_smooth >= 1 else 1 - math.exp(-dt * 60 * current_smooth / (1 - current_smooth))
+    prev_x += (trail_target[0] - prev_x) * k
+    prev_y += (trail_target[1] - prev_y) * k
+    if abs(trail_target[0] - prev_x) < 0.05 and abs(trail_target[1] - prev_y) < 0.05:
+        prev_x, prev_y = trail_target  # settle exactly so the idle skip sees a still trail
+    point = (prev_x, prev_y)
+    if trail and point == trail[-1]:
+        # Still: a duplicate point carries the time it left, so the trail ages from there
+        if len(trail) > 1 and trail[-2] != point:
+            trail.append(point)
+            trail_times.append(t)
         else:
-            current_color = trail_color
-        # Draw main connection line
-        draw_thick_line_with_caps(screen, current_color, 
-                                continuous_trail[i], continuous_trail[i + 1], 
-                                current_thickness)
-    # Secondary rendering: Apply spline smoothing for curved sections
-    if len(continuous_trail) > 3:
-        for i in range(1, len(continuous_trail) - 2):
-            p0, p1, p2, p3 = continuous_trail[i - 1], continuous_trail[i], continuous_trail[i + 1], continuous_trail[i + 2]
-            smooth_points = catmull_rom_spline(p0, p1, p2, p3, num_points=25)
-            for j in range(len(smooth_points) - 1):
-                if trail_fade:
-                    fade = (i + j/25) / len(continuous_trail)
-                    current_color = [int(c * fade) for c in trail_color]
-                else:
-                    current_color = trail_color
-                # Use anti-aliased lines for smooth curves
-                pygame.draw.aaline(screen, current_color, smooth_points[j], smooth_points[j + 1], current_thickness)
-                # Add connection circles for perfect continuity
-                radius = max(1, current_thickness // 2)
-                pygame.draw.circle(screen, current_color, 
-                                 (int(smooth_points[j][0]), int(smooth_points[j][1])), radius)
+            trail_times[-1] = t
+        return
+    if len(trail) > 1 and trail[-2] != trail[-1]:
+        # The head moves on until TRAIL_STEP from the last kept point; turning back keeps it as a tip
+        head = math.dist(trail[-2], trail[-1])
+        if head < TRAIL_STEP and head <= math.dist(trail[-2], point):
+            trail[-1], trail_times[-1] = point, t
+            return
+    trail.append(point)
+    trail_times.append(t)
+
+def prune_trail(cutoff):
+    """Drop trail points older than cutoff, moving the tail to where the stroke was at cutoff"""
+    while len(trail) > 1 and trail_times[1] <= cutoff:
+        del trail[0], trail_times[0]
+    if len(trail) > 1 and trail_times[0] < cutoff:
+        f = (cutoff - trail_times[0]) / (trail_times[1] - trail_times[0])
+        (x0, y0), (x1, y1) = trail[0], trail[1]
+        trail[0], trail_times[0] = (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f), cutoff
+    if len(trail) == 2 and trail[0] == trail[1]:
+        del trail[0], trail_times[0]
 
 # Add this helper function near the top, after global variable definitions:
 def deactivate_all_inputs():
@@ -1950,6 +2120,28 @@ def deactivate_all_inputs():
     trail_hex_input_active = False
     rectangle_hex_input_active = False
     background_hex_input_active = False
+
+def tab_order():
+    """Editable fields in reading order: hex boxes, the area fields while unlocked, then the region fields in use"""
+    order = ["cursor_hex", "trail_hex", "rectangle_hex", "background_hex"]
+    if not active_area_locked:
+        order += ["active_2", "active_3", "active_0", "active_1", "active_4"]  # Width, Height, X, Y, Rotation
+    return order + [f"region_{i}" for i in region_fields()]
+
+def drag_slider(x):
+    """Set the grabbed slider's value from the pointer's x on its track"""
+    global current_trail_length, current_smooth, current_thickness, active_area_thickness
+    track = {"trail": trail_length_slider, "smooth": smooth_factor_slider,
+             "thickness": trail_thickness_slider, "active_area_thickness": area_thickness_slider}[slider_grabbed]
+    f = min(max((x - track.x) / track.width, 0), 1)
+    if slider_grabbed == "trail":
+        current_trail_length = round(min_trail_length + (max_trail_length_limit - min_trail_length) * f)
+    elif slider_grabbed == "smooth":
+        current_smooth = round(min_smooth + (max_smooth - min_smooth) * f, 2)
+    elif slider_grabbed == "thickness":
+        current_thickness = round(min_thickness + (max_thickness - min_thickness) * f)
+    else:
+        active_area_thickness = round(1 + 4 * f)
 
 def get_active_area_from_settings(settings, target_model=None):
     """
@@ -1972,14 +2164,37 @@ def get_active_area_from_settings(settings, target_model=None):
     # Fallback to old logic if not found
     return try_get_tablet_info(settings)
 
+# Idle skip state: what the last drawn frame showed, and whether input arrived since
+last_frame_state = None
+had_events = True
+
+# Start the cursor sampler; from here on only it calls get_cursor_pos (shared POINT buffer)
+mouse_x, mouse_y = get_cursor_pos()
+sampler = threading.Thread(target=sample_cursor, daemon=True)
+sampler.start()
+
+# Settings panel hit rects; each drawn frame replaces them, so clicks test what is on screen
+save_rect = load_rect = reset_rect = close_rect = pygame.Rect(0, 0, 0, 0)
+trail_checkbox = fade_checkbox = main_grid_checkbox = mini_grid_checkbox = mini_screen_checkbox = pygame.Rect(0, 0, 0, 0)
+zoom_checkbox = borderless_checkbox = topmost_checkbox = hide_ui_checkbox = hide_all_checkbox = pygame.Rect(0, 0, 0, 0)
+region_mode_rect = pygame.Rect(0, 0, 0, 0)
+
 # Main game loop
 while running:
-    screen.fill(BACKGROUND_COLOR)
-    small_screen.fill((10, 10, 10))
+    # Every cursor change since the last frame, oldest first; mouse_x/mouse_y end on the newest
+    while cursor_samples:
+        sample_time, mouse_x, mouse_y = cursor_samples.popleft()
+        smooth_trail_to(sample_time)
+        trail_target = screen_to_view(mouse_x, mouse_y)
 
-    # Get current mouse position and update trail
-    mouse_x, mouse_y = pyautogui.position()
-    
+    # Borderless drag: keep the grabbed point under the sampled cursor
+    if window_drag:
+        if pygame.mouse.get_pressed()[0]:
+            user32.SetWindowPos(window_handle(), None, mouse_x - window_drag[0], mouse_y - window_drag[1], 0, 0,
+                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        else:
+            window_drag = None  # released without a MOUSEBUTTONUP
+
     # Handle continuous backspace hold
     if backspace_held and active_input is not None:
         current_time = pygame.time.get_ticks()
@@ -2005,34 +2220,30 @@ while running:
             # Update start time to prevent multiple deletions in one frame
             backspace_start_time = current_time - (repeat_count * backspace_repeat_interval)
 
-    # Get current active area bounds
-    active_bounds = get_active_area_bounds()
+    # Where the pen is on the tablet, in mm
+    tablet_mouse_x, tablet_mouse_y = screen_to_tablet(mouse_x, mouse_y)
 
-    # Map screen coordinates to active area coordinates
-    # Screen (0,0 to SCREEN_WIDTH,SCREEN_HEIGHT) maps to active area (0,0 to active_width,active_height)
-    active_area_mouse_x = (mouse_x / SCREEN_WIDTH) * active_bounds['width']
-    active_area_mouse_y = (mouse_y / SCREEN_HEIGHT) * active_bounds['height']
+    # Trail = the last (length - 1) frames of 60 Hz, faded by age
+    now = time.perf_counter()
+    smooth_trail_to(now)
+    trail_span = max(current_trail_length - 1, 1) / 60
+    prune_trail(now - trail_span)
 
-    # Calculate position within tablet area
-    # Active area position + active area offset = tablet position
-    tablet_mouse_x = active_area_mouse_x + active_bounds['left']
-    tablet_mouse_y = active_area_mouse_y + active_bounds['top']
+    # Nothing moved, nothing open, no input: the last frame is still correct, skip drawing it
+    # (a trail of 2+ points is still fading out)
+    frame_state = (mouse_x, mouse_y, tuple(trail))
+    if (len(trail) < 2 and frame_state == last_frame_state and not had_events and not pygame.event.peek()
+            and not (settings_open or color_picker_open or tooltip_active)):
+        clock.tick(60)
+        continue
+    last_frame_state = frame_state
 
-    # Scale to main window for display (active area fills entire window)
-    scaled_x = int(active_area_mouse_x * (WIN_WIDTH / active_bounds['width']))
-    scaled_y = int(active_area_mouse_y * (WIN_HEIGHT / active_bounds['height']))
-
-    # Smooth movement
-    prev_x += (scaled_x - prev_x) * current_smooth
-    prev_y += (scaled_y - prev_y) * current_smooth
-
-    # Add to trail with length limit
-    trail.append((int(prev_x), int(prev_y)))
-    while len(trail) > current_trail_length:
-        trail.pop(0)
+    screen.fill(BACKGROUND_COLOR)
+    small_screen.fill((10, 10, 10))
 
     mouse_pos = pygame.mouse.get_pos()
-    active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height]
+    # Rebuilt from the OTD-read (or edited) values each frame, so a preset's area never replaces them
+    active_area_values = [active_area_x, active_area_y, active_area_width, active_area_height, active_area_rotation]
     #print(f"BEFORE SETTINGS SHOWS: {active_area_values}")
     #print(f"Active Areaadddddddddddddddd: {active_area_values}")
     if settings_open:
@@ -2049,393 +2260,135 @@ while running:
         title_rect = title.get_rect(centerx=WIN_WIDTH//2, y=20)
         screen.blit(title, title_rect)
         
-        # Define layout constants
-        left_margin = 50
-        right_margin = WIN_WIDTH - 50
-        section_spacing = 80
-        item_spacing = 35
-        checkbox_spacing = 25
-        
-        # Section 1: Colors (top left)
-        y_offset = 80
-        # Cursor Color
-        cursor_color_preview_rect, cursor_hex_input_rect = draw_color_section(
-            y_offset, "Cursor Color", cursor_rgb_values, cursor_rgb_inputs,
-            True, active_input == "cursor_hex", input_text if active_input == "cursor_hex" else "", cursor_hex_input_rect)
-        # Trail Color
-        trail_color_preview_rect, trail_hex_input_rect = draw_color_section(
-            y_offset + 70, "Trail Color", trail_rgb_values, trail_rgb_inputs,
-            False, active_input == "trail_hex", input_text if active_input == "trail_hex" else "", trail_hex_input_rect)
-        # Rectangle Color
-        active_area_color_preview_rect = pygame.Rect(310, y_offset + 25, 80, 40)
-        pygame.draw.rect(screen, active_area_color, active_area_color_preview_rect)
-        pygame.draw.rect(screen, BUTTON_TEXT_COLOR, active_area_color_preview_rect, 2)
-        rectangle_hex_value = rgb_to_hex(*active_area_rgb_values)
-        is_rectangle_active = active_input == "rectangle_hex"
-        if is_rectangle_active:
-            display_text = input_text
-            text_color = INPUT_TEXT_COLOR
-        else:
-            display_text = rectangle_hex_value
-            text_color = INPUT_TEXT_COLOR
-        
-        # Make hex input box longer (120px instead of 70px)
-        input_box_width = 120
-        input_box_height = 30
-        input_box_x = active_area_color_preview_rect.right + 10  # 10px margin to the right
-        input_box_y = active_area_color_preview_rect.y + (active_area_color_preview_rect.height - input_box_height) // 2
-        rectangle_hex_input_rect = pygame.Rect(input_box_x, input_box_y, input_box_width, input_box_height)
-        
-        # Use the same styling as Active Area inputs
-        mouse_pos = pygame.mouse.get_pos()
-        is_hovered = rectangle_hex_input_rect.collidepoint(mouse_pos)
-        
-        # Determine box color based on state (same as draw_input_box)
-        if is_rectangle_active and input_error:
-            box_color = INPUT_BOX_ERROR_COLOR
-            border_color = INPUT_BOX_ERROR_BORDER_COLOR
-        elif is_rectangle_active:
-            box_color = INPUT_BOX_ACTIVE_COLOR
-            border_color = INPUT_BOX_ACTIVE_BORDER_COLOR
-        elif is_hovered:
-            box_color = INPUT_BOX_HOVER_COLOR
-            border_color = INPUT_BOX_BORDER_COLOR
-        else:
-            box_color = INPUT_BOX_COLOR
-            border_color = INPUT_BOX_BORDER_COLOR
-        
-        # Draw input box with border
-        pygame.draw.rect(screen, box_color, rectangle_hex_input_rect)
-        pygame.draw.rect(screen, border_color, rectangle_hex_input_rect, 2)
-        
-        # Add subtle shadow/glow effect for active input
-        if is_rectangle_active:
-            # Draw a subtle glow around the active input
-            glow_rect = pygame.Rect(rectangle_hex_input_rect.x - 2, rectangle_hex_input_rect.y - 2, rectangle_hex_input_rect.width + 4, rectangle_hex_input_rect.height + 4)
-            pygame.draw.rect(screen, (100, 150, 255, 50), glow_rect, 1)
-        
-        # Draw text left-aligned with padding (same as draw_input_box)
-        text_x = rectangle_hex_input_rect.x + 8
-        text_y = rectangle_hex_input_rect.y + (input_box_height - font.get_height()) // 2
-        text_surface = font.render(display_text, True, text_color)
-        screen.blit(text_surface, (text_x, text_y))
-        
-        # Draw cursor if active (same as draw_input_box)
-        if is_rectangle_active:
-            if input_text != "":
-                cursor_x = text_x + font.render(input_text, True, text_color).get_width()
-            else:
-                cursor_x = text_x  # Cursor at start when input is empty
-            cursor_y = text_y
-            cursor_height = text_surface.get_height()
-            
-            # Blinking cursor effect (same as draw_input_box)
-            if pygame.time.get_ticks() % 1000 < 500:
-                pygame.draw.line(screen, INPUT_TEXT_COLOR, 
-                               (cursor_x, cursor_y), 
-                               (cursor_x, cursor_y + cursor_height), 2)
-        
-        # Draw hover tooltip (same as draw_input_box)
-        if is_hovered and not is_rectangle_active:
-            tooltip_text = "Click to edit"
-            tooltip_surface = font.render(tooltip_text, True, (200, 200, 200))
-            tooltip_rect = tooltip_surface.get_rect()
-            tooltip_rect.topleft = (rectangle_hex_input_rect.x, rectangle_hex_input_rect.y - 25)
-            
-            # Draw tooltip background
-            tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
-                                   tooltip_rect.width + 10, tooltip_rect.height + 4)
-            pygame.draw.rect(screen, (40, 40, 40), tooltip_bg)
-            pygame.draw.rect(screen, (100, 100, 100), tooltip_bg, 1)
-            screen.blit(tooltip_surface, tooltip_rect)
-        # Rectangle label
-        color_label = font.render("Rectangle Color", True, BUTTON_TEXT_COLOR)
-        screen.blit(color_label, (310, y_offset))
-        
-        # Add hover tooltip for rectangle color picker
-        if active_area_color_preview_rect.collidepoint(mouse_pos):
-            tooltip_text = "Click to use RGB selector"
-            tooltip_surface = font.render(tooltip_text, True, (200, 200, 200))
-            tooltip_rect = tooltip_surface.get_rect()
-            tooltip_rect.topleft = (active_area_color_preview_rect.x, active_area_color_preview_rect.y - 25)
-            
-            # Draw tooltip background
-            tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
-                                   tooltip_rect.width + 10, tooltip_rect.height + 4)
-            pygame.draw.rect(screen, (40, 40, 40), tooltip_bg)
-            pygame.draw.rect(screen, (100, 100, 100), tooltip_bg, 1)
-            screen.blit(tooltip_surface, tooltip_rect)
-        
-        # Background Color
-        background_color_preview_rect = pygame.Rect(530, y_offset + 25, 80, 40)
-        pygame.draw.rect(screen, background_rgb_values, background_color_preview_rect)
-        pygame.draw.rect(screen, BUTTON_TEXT_COLOR, background_color_preview_rect, 2)
-        bg_label = font.render("Background Color", True, BUTTON_TEXT_COLOR)
-        screen.blit(bg_label, (530, y_offset))
-        
-        # Add hover tooltip for background color picker
-        if background_color_preview_rect.collidepoint(mouse_pos):
-            tooltip_text = "Click to use RGB selector"
-            tooltip_surface = font.render(tooltip_text, True, (200, 200, 200))
-            tooltip_rect = tooltip_surface.get_rect()
-            tooltip_rect.topleft = (background_color_preview_rect.x, background_color_preview_rect.y - 25)
-            
-            # Draw tooltip background
-            tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
-                                   tooltip_rect.width + 10, tooltip_rect.height + 4)
-            pygame.draw.rect(screen, (40, 40, 40), tooltip_bg)
-            pygame.draw.rect(screen, (100, 100, 100), tooltip_bg, 1)
-            screen.blit(tooltip_surface, tooltip_rect)
-        # Background hex input box (move to the right of the preview)
-        bg_hex_value = rgb_to_hex(*background_rgb_values)
-        is_background_active = active_input == "background_hex"
-        if is_background_active:
-            display_text = input_text
-            text_color = INPUT_TEXT_COLOR
-        else:
-            display_text = bg_hex_value
-            text_color = INPUT_TEXT_COLOR
-        
-        # Make hex input box longer (120px instead of 70px)
-        input_box_width = 120
-        input_box_height = 30
-        input_box_x = background_color_preview_rect.right + 10  # 10px margin to the right
-        input_box_y = background_color_preview_rect.y + (background_color_preview_rect.height - input_box_height) // 2
-        background_hex_input_rect = pygame.Rect(input_box_x, input_box_y, input_box_width, input_box_height)
-        
-        # Use the same styling as Active Area inputs
-        mouse_pos = pygame.mouse.get_pos()
-        is_hovered = background_hex_input_rect.collidepoint(mouse_pos)
-        
-        # Determine box color based on state (same as draw_input_box)
-        if is_background_active and input_error:
-            box_color = INPUT_BOX_ERROR_COLOR
-            border_color = INPUT_BOX_ERROR_BORDER_COLOR
-        elif is_background_active:
-            box_color = INPUT_BOX_ACTIVE_COLOR
-            border_color = INPUT_BOX_ACTIVE_BORDER_COLOR
-        elif is_hovered:
-            box_color = INPUT_BOX_HOVER_COLOR
-            border_color = INPUT_BOX_BORDER_COLOR
-        else:
-            box_color = INPUT_BOX_COLOR
-            border_color = INPUT_BOX_BORDER_COLOR
-        
-        # Draw input box with border
-        pygame.draw.rect(screen, box_color, background_hex_input_rect)
-        pygame.draw.rect(screen, border_color, background_hex_input_rect, 2)
-        
-        # Add subtle shadow/glow effect for active input
-        if is_background_active:
-            # Draw a subtle glow around the active input
-            glow_rect = pygame.Rect(background_hex_input_rect.x - 2, background_hex_input_rect.y - 2, background_hex_input_rect.width + 4, background_hex_input_rect.height + 4)
-            pygame.draw.rect(screen, (100, 150, 255, 50), glow_rect, 1)
-        
-        # Draw text left-aligned with padding (same as draw_input_box)
-        text_x = background_hex_input_rect.x + 8
-        text_y = background_hex_input_rect.y + (input_box_height - font.get_height()) // 2
-        text_surface = font.render(display_text, True, text_color)
-        screen.blit(text_surface, (text_x, text_y))
-        
-        # Draw cursor if active (same as draw_input_box)
-        if is_background_active:
-            if input_text != "":
-                cursor_x = text_x + font.render(input_text, True, text_color).get_width()
-            else:
-                cursor_x = text_x  # Cursor at start when input is empty
-            cursor_y = text_y
-            cursor_height = text_surface.get_height()
-            
-            # Blinking cursor effect (same as draw_input_box)
-            if pygame.time.get_ticks() % 1000 < 500:
-                pygame.draw.line(screen, INPUT_TEXT_COLOR, 
-                               (cursor_x, cursor_y), 
-                               (cursor_x, cursor_y + cursor_height), 2)
-        
-        # Draw hover tooltip (same as draw_input_box)
-        if is_hovered and not is_background_active:
-            tooltip_text = "Click to edit"
-            tooltip_surface = font.render(tooltip_text, True, (200, 200, 200))
-            tooltip_rect = tooltip_surface.get_rect()
-            tooltip_rect.topleft = (background_hex_input_rect.x, background_hex_input_rect.y - 25)
-            
-            # Draw tooltip background
-            tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
-                                   tooltip_rect.width + 10, tooltip_rect.height + 4)
-            pygame.draw.rect(screen, (40, 40, 40), tooltip_bg)
-            pygame.draw.rect(screen, (100, 100, 100), tooltip_bg, 1)
-            screen.blit(tooltip_surface, tooltip_rect)
+        # Grid: three 220-px columns. Row 1: Colors | Trail | Minimap + OBS. Row 2: Active Area (2 columns) | Tracking region.
+        col_x = (40, 290, 540)
+        row_y = (64, 432)
 
-        # Rectangle Thickness (below color picker)
-        thickness_label = font.render(f"Rectangle Thickness: {active_area_thickness}", True, BUTTON_TEXT_COLOR)
-        screen.blit(thickness_label, (310, y_offset + 80))
-        # Draw thickness slider (bigger and 1-5 range)
-        thickness_slider_rect = pygame.Rect(310, y_offset + 105, 150, 15)
-        pygame.draw.rect(screen, (80, 80, 80), thickness_slider_rect)
-        # Calculate slider position (1-5 range)
-        slider_pos = 310 + (active_area_thickness - 1) * (150 / 4)
-        pygame.draw.circle(screen, (200, 200, 200), (int(slider_pos), y_offset + 112), 8)
-        
+        # Colors (column 1)
+        x, y = col_x[0], row_y[0]
+        draw_section_header(x, y, "Colors")
+        cursor_color_preview_rect, cursor_hex_input_rect = draw_color_section(x, y + 28, "Cursor color", cursor_rgb_values, "cursor_hex")
+        trail_color_preview_rect, trail_hex_input_rect = draw_color_section(x, y + 104, "Trail color", trail_rgb_values, "trail_hex")
+        active_area_color_preview_rect, rectangle_hex_input_rect = draw_color_section(
+            x, y + 180, "Area color", active_area_rgb_values, "rectangle_hex")
+        background_color_preview_rect, background_hex_input_rect = draw_color_section(
+            x, y + 256, "Background color", background_rgb_values, "background_hex")
 
-        
-        # Section 3: Trail Settings (middle left)
-        y_offset = 220
-        section_title = font.render("Trail Settings", True, BUTTON_TEXT_COLOR)
-        screen.blit(section_title, (left_margin, y_offset))
-        
-        # Trail checkboxes
-        trail_checkbox = draw_checkbox(left_margin, y_offset + 30, "Enable Cursor Trail", enable_trail)
-        fade_checkbox = draw_checkbox(left_margin + 200, y_offset + 30, "Enable Trail Fade", trail_fade)
-        
-        # Trail sliders (increased spacing from checkboxes)
-        slider_x = left_margin
-        slider_y = y_offset + 90  # Increased from 70 to 90
-        trail_length_slider, handle_rect = draw_slider(
-            slider_x, slider_y, SLIDER_WIDTH, 
-            current_trail_length, min_trail_length, max_trail_length_limit,
-            "Trail Length"
-        )
-        
-        slider_y = y_offset + 130  # Increased from 110 to 130
+        # Trail (column 2); length shows its real duration, (N-1)/60 s
+        x, y = col_x[1], row_y[0]
+        draw_section_header(x, y, "Trail")
+        trail_checkbox = draw_checkbox(x, y + 28, "Cursor trail", enable_trail)
+        fade_checkbox = draw_checkbox(x, y + 56, "Trail fade", trail_fade)
+        main_grid_checkbox = draw_checkbox(x, y + 84, "Main grid", enable_main_grid)
+        trail_length_slider, _ = draw_slider(
+            x, y + 142, SLIDER_WIDTH, current_trail_length, min_trail_length, max_trail_length_limit,
+            "Trail length", f"{round((current_trail_length - 1) * 1000 / 60)} ms", slider_grabbed == "trail")
         smooth_factor_slider, _ = draw_slider(
-            slider_x, slider_y, SLIDER_WIDTH,
-            current_smooth, min_smooth, max_smooth,
-            "Smoothness"
-        )
-        
-        slider_y = y_offset + 170  # Increased from 150 to 170
+            x, y + 190, SLIDER_WIDTH, current_smooth, min_smooth, max_smooth,
+            "Follow speed", f"{current_smooth:.2f}", slider_grabbed == "smooth")
         trail_thickness_slider, _ = draw_slider(
-            slider_x, slider_y, SLIDER_WIDTH,
-            current_thickness, min_thickness, max_thickness,
-            "Trail Thickness"
-        )
-        
-        # Section 4: Grid Settings (middle right)
-        y_offset = 220
-        section_title = font.render("Grid Settings", True, BUTTON_TEXT_COLOR)
-        screen.blit(section_title, (right_margin - 200, y_offset))
-        
-        main_grid_checkbox = draw_checkbox(right_margin - 200, y_offset + 30, "Enable Main Grid", enable_main_grid)
-        mini_grid_checkbox = draw_checkbox(right_margin - 200, y_offset + 55, "Enable Mini Grid", enable_mini_grid)
-        mini_screen_checkbox = draw_checkbox(right_margin - 200, y_offset + 100, "Enable Mini Screen", enable_mini_screen)
-        
-        # Section 5: Active Area (bottom left)
-        y_offset = 420
-        section_title = font.render("Active Area (mm) (not available)", True, BUTTON_TEXT_COLOR)
-        screen.blit(section_title, (left_margin, y_offset))
-        
-        # First row: Width, Height
-        labels_row1 = ["Width:", "Height:"]
-        for i in range(2):
-            active_area_inputs[i+2].x = left_margin + 60 + i * 180  # Width (index 2), Height (index 3)
-            active_area_inputs[i+2].y = y_offset + 30
-            is_active = active_input == f"active_{i+2}"
-            #print(f"IF BOX ON WIDTH HEIGH: Width: {active_area_values[2]}, Height: {active_area_values[3]}, Box: {active_area_values[0]}, {active_area_values[1]}, Value: {active_area_values}")
-            draw_input_box(active_area_inputs[i+2], active_area_values[i+2], is_active, labels_row1[i])
-        
-        # Second row: X, Y
-        labels_row2 = ["X:", "Y:"]
-        for i in range(2):
-            active_area_inputs[i].x = left_margin + 60 + i * 180  # X (index 0), Y (index 1)
-            active_area_inputs[i].y = y_offset + 70
-            is_active = active_input == f"active_{i}"
-            draw_input_box(active_area_inputs[i], active_area_values[i], is_active, labels_row2[i])
-        
-        # Draw protection shield overlay if active area is locked
-        if active_area_locked:
-            # Create a semi-transparent grey overlay covering the entire active area section
-            shield_rect = pygame.Rect(left_margin - 10, y_offset - 10, 400, 120)  # Covers the entire section
-            
-            # Draw semi-transparent grey background
-            shield_surface = pygame.Surface((shield_rect.width, shield_rect.height), pygame.SRCALPHA)
-            shield_surface.fill((80, 80, 80, 180))  # Grey with alpha
-            screen.blit(shield_surface, shield_rect)
-            
-            # Draw border
-            pygame.draw.rect(screen, (120, 120, 120), shield_rect, 2)
-            
-            # Draw lock icon or warning text
-            warning_text = "⚠️ PROTECTED AREA"
-            warning_surface = font.render(warning_text, True, (200, 200, 200))
-            warning_rect = warning_surface.get_rect(centerx=shield_rect.centerx, y=shield_rect.centery - 15)
-            screen.blit(warning_surface, warning_rect)
-            
-            # Draw unlock instruction
-            unlock_text = f"Click {3 - active_area_unlock_clicks} more times to unlock"
-            unlock_surface = font.render(unlock_text, True, (150, 150, 150))
-            unlock_rect = unlock_surface.get_rect(centerx=shield_rect.centerx, y=shield_rect.centery + 15)
-            screen.blit(unlock_surface, unlock_rect)
-            
-            # Check for hover and show tooltip
-            mouse_pos = pygame.mouse.get_pos()
-            if shield_rect.collidepoint(mouse_pos):
-                tooltip_text = "⚠️ WARNING: Changing active area may break tablet functionality!"
-                tooltip_surface = font.render(tooltip_text, True, (255, 200, 200))
-                tooltip_rect = tooltip_surface.get_rect()
-                tooltip_rect.topleft = (shield_rect.x, shield_rect.y - 40)
-                
-                # Draw tooltip background
-                tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
-                                       tooltip_rect.width + 10, tooltip_rect.height + 4)
-                pygame.draw.rect(screen, (60, 40, 40), tooltip_bg)
-                pygame.draw.rect(screen, (200, 100, 100), tooltip_bg, 1)
-                screen.blit(tooltip_surface, tooltip_rect)
-            
-            # Check for hover and show tooltip
-            mouse_pos = pygame.mouse.get_pos()
-            if shield_rect.collidepoint(mouse_pos):
-                tooltip_text = "⚠️ WARNING: Changing active area may break tablet functionality!"
-                tooltip_surface = font.render(tooltip_text, True, (255, 200, 200))
-                tooltip_rect = tooltip_surface.get_rect()
-                tooltip_rect.topleft = (shield_rect.x, shield_rect.y - 40)
-                
-                # Draw tooltip background
-                tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2, 
-                                       tooltip_rect.width + 10, tooltip_rect.height + 4)
-                pygame.draw.rect(screen, (60, 40, 40), tooltip_bg)
-                pygame.draw.rect(screen, (200, 100, 100), tooltip_bg, 1)
-                screen.blit(tooltip_surface, tooltip_rect)
-        
-        # Section 6: File Operations (bottom right)
-        y_offset = 380
-        section_title = font.render("File Operations", True, BUTTON_TEXT_COLOR)
-        screen.blit(section_title, (right_margin - 200, y_offset))
-        
-        save_rect = pygame.Rect(right_margin - 200, y_offset + 30, 80, 30)
-        load_rect = pygame.Rect(right_margin - 200, y_offset + 70, 80, 30)
-        reset_rect = pygame.Rect(right_margin - 200, y_offset + 110, 80, 30)
-        
-        pygame.draw.rect(screen, BUTTON_COLOR, save_rect)
-        pygame.draw.rect(screen, BUTTON_COLOR, load_rect)
-        pygame.draw.rect(screen, BUTTON_COLOR, reset_rect)
-        
-        save_text = font.render("Save", True, BUTTON_TEXT_COLOR)
-        load_text = font.render("Load", True, BUTTON_TEXT_COLOR)
-        reset_text = font.render("Reset", True, BUTTON_TEXT_COLOR)
-        
-        screen.blit(save_text, (save_rect.centerx - save_text.get_width()//2, 
-                               save_rect.centery - save_text.get_height()//2))
-        screen.blit(load_text, (load_rect.centerx - load_text.get_width()//2, 
-                               load_rect.centery - load_text.get_height()//2))
-        screen.blit(reset_text, (reset_rect.centerx - reset_text.get_width()//2, 
-                                reset_rect.centery - reset_text.get_height()//2))
+            x, y + 238, SLIDER_WIDTH, current_thickness, min_thickness, max_thickness,
+            "Trail thickness", grabbed=slider_grabbed == "thickness")
 
-        # Draw help text if an input is active
+        # Minimap (column 3)
+        x, y = col_x[2], row_y[0]
+        draw_section_header(x, y, "Minimap")
+        mini_screen_checkbox = draw_checkbox(x, y + 28, "Show minimap", enable_mini_screen)
+        mini_grid_checkbox = draw_checkbox(x, y + 56, "Minimap grid", enable_mini_grid)
+        zoom_checkbox = draw_checkbox(x, y + 84, "Zoom to area", minimap_zoom)
+        area_thickness_slider, _ = draw_slider(
+            x, y + 142, SLIDER_WIDTH, active_area_thickness, 1, 5,
+            "Area thickness", grabbed=slider_grabbed == "active_area_thickness")
+
+        # OBS (column 3, under Minimap): the Alt menu's states, plus always on top
+        y = row_y[0] + 180
+        draw_section_header(x, y, "OBS")
+        borderless_checkbox = draw_checkbox(x, y + 28, "Borderless", borderless)
+        topmost_checkbox = draw_checkbox(x, y + 56, "Always on top", always_on_top)
+        hide_ui_checkbox = draw_checkbox(x, y + 84, "Hide UI", hide_ui and not hide_minimap)
+        hide_all_checkbox = draw_checkbox(x, y + 112, "Hide UI + minimap", hide_ui and hide_minimap)
+        for i, hint in enumerate(("Alt + 1/2/3 also toggle these", "Borderless: drag to move")):
+            screen.blit(font.render(hint, True, (150, 150, 150)), (x, y + 142 + i * 18))
+
+        # Active Area (row 2, columns 1-2), OTD's numbers: X/Y are the area's centre
+        x, y = col_x[0], row_y[1]
+        area_width = col_x[1] + 220 - x
+        draw_section_header(x, y, "Active Area (mm)", area_width)
+        clicks_left = 3 - active_area_unlock_clicks
+        if not active_area_locked:
+            lock_hint = "Unlocked"
+        elif clicks_left == 3:
+            lock_hint = "Locked: click 3 times to unlock"
+        else:
+            lock_hint = f"Click {clicks_left} more time{'s' if clicks_left > 1 else ''} to unlock"
+        screen.blit(font.render(lock_hint, True, (150, 150, 150)), (x + font.size("Active Area (mm)")[0] + 15, y))
+        active_area_section = pygame.Rect(x - 4, y - 6, area_width + 8, 106)
+
+        # Width, Height / X, Y, Rotation; shown to 2 decimals, kept at full precision
+        column_x = (x + 60, x + 220, x + 390)
+        for row, fields in enumerate((((2, "Width:"), (3, "Height:")), ((0, "X:"), (1, "Y:"), (4, "Rotation:")))):
+            for column, (i, label) in enumerate(fields):
+                active_area_inputs[i].topleft = (column_x[column], y + 28 + row * 38)
+                draw_input_box(active_area_inputs[i], f"{active_area_values[i]:.2f}", active_input == f"active_{i}",
+                               label, editable=not active_area_locked)
+
+        # Locked: dim the fields without hiding the values
+        if active_area_locked:
+            dim_surface = pygame.Surface((active_area_section.width, 76), pygame.SRCALPHA)
+            dim_surface.fill((*MODAL_BG_COLOR, 110))
+            screen.blit(dim_surface, (active_area_section.x, y + 24))
+
+            mouse_pos = pygame.mouse.get_pos()
+            if active_area_section.collidepoint(mouse_pos):
+                tooltip_text = "Read from OTD. Edits change only this mini-map, not OTD."
+                tooltip_surface = font.render(tooltip_text, True, (255, 200, 200))
+                tooltip_rect = tooltip_surface.get_rect()
+                tooltip_rect.topleft = (active_area_section.x, active_area_section.y - 40)
+
+                # Draw tooltip background
+                tooltip_bg = pygame.Rect(tooltip_rect.x - 5, tooltip_rect.y - 2,
+                                       tooltip_rect.width + 10, tooltip_rect.height + 4)
+                pygame.draw.rect(screen, (60, 40, 40), tooltip_bg)
+                pygame.draw.rect(screen, (200, 100, 100), tooltip_bg, 1)
+                screen.blit(tooltip_surface, tooltip_rect)
+
+        # Tracking region (row 2, column 3): mode (click a side to step), sensitivity, then position and scale (H, V)
+        x, y = col_x[2], row_y[1]
+        draw_section_header(x, y, "Tracking region")
+        region_mode_rect = pygame.Rect(x, y + 25, 150, 22)
+        draw_button(screen, f"< {REGION_MODES[region_mode]} >", region_mode_rect, region_mode_rect.collidepoint(mouse_pos), boxed=True)
+        region_inputs[4].update(x + 158, y + 25, 62, 22)
+        for i, label in enumerate(("Position:", "Scale:")):
+            region_inputs[2 * i].update(x + 80, y + 51 + i * 26, 66, 22)
+            region_inputs[2 * i + 1].update(x + 154, y + 51 + i * 26, 66, 22)
+            label_surface = font.render(label, True, BUTTON_TEXT_COLOR)
+            screen.blit(label_surface, label_surface.get_rect(right=x + 72, centery=region_inputs[2 * i].centery))
+        for i in (4, 0, 1, 2, 3):  # top row first, so a hover tooltip stays on top
+            enabled, unit = i in region_fields(), "x" if i == 4 else "%"
+            draw_input_box(region_inputs[i], f"{region_values[i]:g}{unit}", active_input == f"region_{i}", editable=enabled,
+                           tooltip=f"lazer {REGION_LABELS[i]}, {REGION_LIMITS[i][0]:g}-{REGION_LIMITS[i][1]:g}{unit}")
+            if not enabled:  # unused by this mode: dimmed, value still readable
+                dim_surface = pygame.Surface(region_inputs[i].size, pygame.SRCALPHA)
+                dim_surface.fill((*MODAL_BG_COLOR, 150))
+                screen.blit(dim_surface, region_inputs[i])
+
+        # Bottom bar: preset file actions on the left, Close on the right
+        pygame.draw.line(screen, (70, 70, 70), (col_x[0], 538), (WIN_WIDTH - col_x[0], 538))
+        save_rect = pygame.Rect(col_x[0], 550, 90, 32)
+        load_rect = pygame.Rect(col_x[0] + 100, 550, 90, 32)
+        reset_rect = pygame.Rect(col_x[0] + 200, 550, 90, 32)
+        close_rect = pygame.Rect(WIN_WIDTH - col_x[0] - 90, 550, 90, 32)
+        for rect, text in ((save_rect, "Save"), (load_rect, "Load"), (reset_rect, "Reset"), (close_rect, "Close")):
+            draw_button(screen, text, rect, rect.collidepoint(mouse_pos), boxed=True)
+
+        # Editing help, between the buttons
         if active_input is not None:
             if input_error:
-                help_text = f"Error: {error_message} | Escape: Cancel"
-                help_color = (255, 150, 150)
+                help_text, help_color = error_message, (255, 150, 150)
             else:
-                help_text = "Enter: Apply | Escape: Cancel | Tab: Next | Shift+Tab: Previous"
-                help_color = (150, 150, 150)
-            
+                help_text, help_color = "Enter: apply   Esc: cancel   Tab: next", (150, 150, 150)
             help_surface = font.render(help_text, True, help_color)
-            help_rect = help_surface.get_rect(centerx=WIN_WIDTH//2, y=WIN_HEIGHT - 60)
-            screen.blit(help_surface, help_rect)
-        
-        # Draw close button (bottom center)
-        button_hover = button_rect.collidepoint(mouse_pos)
-        draw_button(screen, "Close", button_rect, button_hover)
+            screen.blit(help_surface, help_surface.get_rect(center=((reset_rect.right + close_rect.left) // 2, close_rect.centery)))
     
     # Draw color picker popup if open
     if color_picker_open:
@@ -2447,16 +2400,18 @@ while running:
         mini_visible = enable_mini_screen and not hide_minimap
 
         # Always draw trail if enabled and has enough points
-        render_trail(screen, trail, trail_color, current_thickness, enable_trail, trail_fade)
+        render_trail(screen, trail, trail_color, current_thickness, enable_trail, trail_fade,
+                     [1 - (now - t) / trail_span for t in trail_times])
 
         # Always draw cursor
         if trail:
-            pygame.draw.circle(screen, cursor_color, trail[-1], 5)
+            pygame.draw.circle(screen, cursor_color, (trail[-1][0] + 0.5, trail[-1][1] + 0.5), 5)
 
         if not hide_ui:
-            # Draw main grid if enabled
+            # Draw main grid if enabled, over the tracking region only (not the letterbox bars)
             if enable_main_grid:
-                draw_grid(screen, WIN_WIDTH, WIN_HEIGHT, GRID_SPACING, GRID_COLOR)
+                grid_rect = view_rect()
+                draw_grid(screen.subsurface(grid_rect), grid_rect.width, grid_rect.height, GRID_SPACING, GRID_COLOR)
 
             # Draw settings button (only when settings are closed)
             button_hover = button_rect.collidepoint(mouse_pos)
@@ -2474,57 +2429,58 @@ while running:
         # Clear mini display
         small_screen.fill((10, 10, 10))
 
+        # Active area = the display's corners mapped back onto the tablet, so it follows OTD's rotation
+        centre_x, centre_y, display_w, display_h = display_area
+        area_corners = [screen_to_tablet(centre_x + sx * display_w / 2, centre_y + sy * display_h / 2)
+                        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+        if minimap_zoom:
+            # Frame the area's bounding box plus a quarter of its longer side
+            xs, ys = [c[0] for c in area_corners], [c[1] for c in area_corners]
+            pad = max(max(xs) - min(xs), max(ys) - min(ys)) / 4
+            minimap_view = (min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad)
+        else:
+            minimap_view = (0, 0, tablet_width, tablet_height)
+
+        # Full tablet outline (white), upright at its real aspect; zoomed in, only edges inside the view show
+        left, top = tablet_to_minimap(0, 0)
+        right, bottom = tablet_to_minimap(tablet_width, tablet_height)
+        tablet_outline = pygame.Rect(round(left), round(top), round(right - left), round(bottom - top))
+        tablet_rect = tablet_outline.clip(small_screen.get_rect())
+
         # Draw mini grid if enabled
         if enable_mini_grid:
-            draw_grid(small_screen, SMALL_WIN_WIDTH, SMALL_WIN_HEIGHT, 10, GRID_COLOR)
+            draw_grid(small_screen.subsurface(tablet_rect), tablet_rect.width, tablet_rect.height, 10, GRID_COLOR)
+        pygame.draw.rect(small_screen, (255, 255, 255), tablet_outline, 2)
 
-        # Draw full tablet area outline (white)
-        pygame.draw.rect(small_screen, (255, 255, 255), (0, 0, SMALL_WIN_WIDTH, SMALL_WIN_HEIGHT), 2)
+        corners = [tablet_to_minimap(*corner) for corner in area_corners]
+        for i in range(4):
+            draw_thick_line_with_caps(small_screen, active_area_color, corners[i - 1], corners[i], active_area_thickness)
 
-        # Get current active area bounds
-        active_bounds = get_active_area_bounds()
-
-        # Calculate mini display coordinates for active area
-        mini_active_x = (active_bounds['left'] / tablet_width) * SMALL_WIN_WIDTH
-        mini_active_y = (active_bounds['top'] / tablet_height) * SMALL_WIN_HEIGHT
-        mini_active_w = (active_bounds['width'] / tablet_width) * SMALL_WIN_WIDTH
-        mini_active_h = (active_bounds['height'] / tablet_height) * SMALL_WIN_HEIGHT
-
-        # Draw active area outline (customizable color and thickness)
-        pygame.draw.rect(small_screen, active_area_color, 
-                        (mini_active_x, mini_active_y, mini_active_w, mini_active_h), active_area_thickness)
+        # Tracking region (osu! modes): its screen corners mapped onto the tablet, dashed
+        if region_mode:
+            rx, ry, rw, rh = tracking_region()
+            region_corners = [tablet_to_minimap(*screen_to_tablet(rx + fx * rw, ry + fy * rh))
+                              for fx, fy in ((0, 0), (1, 0), (1, 1), (0, 1))]
+            for i in range(4):
+                draw_dashed_line(small_screen, REGION_COLOR, region_corners[i - 1], region_corners[i])
 
         # Map cursor position to mini display
-        mini_cursor_x = (tablet_mouse_x / tablet_width) * SMALL_WIN_WIDTH
-        mini_cursor_y = (tablet_mouse_y / tablet_height) * SMALL_WIN_HEIGHT
+        mini_cursor_x, mini_cursor_y = tablet_to_minimap(tablet_mouse_x, tablet_mouse_y)
 
         # Draw mini cursor
         pygame.draw.circle(small_screen, cursor_color, (int(mini_cursor_x), int(mini_cursor_y)), 3)
 
         # Draw to main screen
-        screen.blit(small_screen, (WIN_WIDTH - SMALL_WIN_WIDTH - 10, WIN_HEIGHT - SMALL_WIN_HEIGHT - 10))
+        screen.blit(small_screen, minimap_rect)
 
     if tooltip_active:
         draw_tooltip_overlay()
-        pygame.display.update()
-        clock.tick(60)
-        # Do not continue; allow event processing below
-    else:
-        # Only show main content when settings are closed and not hiding UI
-        if not settings_open and not hide_ui:
-            # ... existing code ...
-            mini_visible = enable_mini_screen and not hide_minimap
-            pass
-        # ... existing code ...
-        if mini_visible and not hide_minimap:
-            # ... existing code ...
-            pass
-    # ... existing code ...
     pygame.display.update()
     clock.tick(60)
-    # ... existing code ...
 
-    for event in pygame.event.get():
+    events = pygame.event.get()
+    had_events = bool(events)
+    for event in events:
         if event.type == pygame.QUIT:
             running = False
 
@@ -2596,8 +2552,14 @@ while running:
                 if not settings_open:
                     if button_rect.collidepoint(event.pos):
                         settings_open = True
+                    elif borderless and not (mini_visible and minimap_rect.collidepoint(event.pos)):
+                        # No title bar: dragging the empty view moves the window
+                        drag_rect, drag_origin = wintypes.RECT(), wintypes.POINT(0, 0)
+                        user32.GetWindowRect(window_handle(), ctypes.byref(drag_rect))
+                        user32.ClientToScreen(window_handle(), ctypes.byref(drag_origin))
+                        window_drag = (event.pos[0] + drag_origin.x - drag_rect.left, event.pos[1] + drag_origin.y - drag_rect.top)
                 else:
-                    if button_rect.collidepoint(event.pos):
+                    if close_rect.collidepoint(event.pos):
                         settings_open = False
                     elif save_rect.collidepoint(event.pos):
                         if save_settings():
@@ -2623,16 +2585,28 @@ while running:
                         enable_mini_grid = not enable_mini_grid
                     elif mini_screen_checkbox.collidepoint(event.pos):
                         enable_mini_screen = not enable_mini_screen
+                    elif zoom_checkbox.collidepoint(event.pos):
+                        minimap_zoom = not minimap_zoom
+                    elif borderless_checkbox.collidepoint(event.pos):
+                        set_borderless(not borderless)
+                    elif topmost_checkbox.collidepoint(event.pos):
+                        always_on_top = not always_on_top
+                        apply_always_on_top()
+                    elif hide_ui_checkbox.collidepoint(event.pos):
+                        toggle_overlay_mode(False)
+                    elif hide_all_checkbox.collidepoint(event.pos):
+                        toggle_overlay_mode(True)
+                    elif region_mode_rect.collidepoint(event.pos):
+                        region_mode = (region_mode + (1 if event.pos[0] >= region_mode_rect.centerx else -1)) % len(REGION_MODES)
+                        set_view()
 
-                    # Handle slider clicks
-                    for i, slider in enumerate([trail_length_slider, smooth_factor_slider, trail_thickness_slider]):
-                        if slider.collidepoint(event.pos):
-                            slider_grabbed = ["trail", "smooth", "thickness"][i]
+                    # Sliders: the drawn track plus the handle's overhang; a click sets the value
+                    for name, slider in (("trail", trail_length_slider), ("smooth", smooth_factor_slider),
+                                         ("thickness", trail_thickness_slider), ("active_area_thickness", area_thickness_slider)):
+                        if slider.inflate(10, 10).collidepoint(event.pos):
+                            slider_grabbed = name
+                            drag_slider(event.pos[0])
                             break
-                    # Handle active area thickness slider (always available)
-                    thickness_slider_rect = pygame.Rect(350, 80 + 105, 150, 15)
-                    if thickness_slider_rect.collidepoint(event.pos):
-                        slider_grabbed = "active_area_thickness"
 
                     # Handle input boxes (RGB + Active Area)
                     input_clicked = False
@@ -2695,18 +2669,25 @@ while running:
                         input_clicked = True
                     # Active Area inputs (only if unlocked)
                     if not input_clicked and not active_area_locked:
-                        for i in range(4):
+                        for i in range(5):
                             if active_area_inputs[i].collidepoint(event.pos):
                                 active_input = f"active_{i}"
                                 input_text = str(active_area_values[i])
                                 input_clicked = True
                                 break
-                    
+                    # Tracking region inputs, those the mode uses
+                    if not input_clicked:
+                        for i in region_fields():
+                            if region_inputs[i].collidepoint(event.pos):
+                                active_input = f"region_{i}"
+                                input_text = f"{region_values[i]:g}"
+                                input_clicked = True
+                                break
+
                     # Check for protection shield clicks
                     if not input_clicked and active_area_locked:
                         # Check if click is in the active area section
-                        shield_rect = pygame.Rect(left_margin - 10, 420 - 10, 400, 120)
-                        if shield_rect.collidepoint(event.pos):
+                        if active_area_section.collidepoint(event.pos):
                             active_area_unlock_clicks += 1
                             active_area_unlock_timer = pygame.time.get_ticks()
                             
@@ -2724,33 +2705,14 @@ while running:
         elif event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:  # Left click release
                 slider_grabbed = False
+                window_drag = None
                 # Stop color picker dragging
                 color_picker_dragging = False
                 color_picker_drag_type = None
         
         elif event.type == pygame.MOUSEMOTION:
             if slider_grabbed:
-                if slider_grabbed == "trail":
-                    rel_x = event.pos[0] - trail_length_slider.x
-                    current_trail_length = int(min_trail_length + 
-                        (max_trail_length_limit - min_trail_length) * 
-                        (rel_x / SLIDER_WIDTH))
-                    current_trail_length = max(min_trail_length, 
-                        min(max_trail_length_limit, current_trail_length))
-                elif slider_grabbed == "smooth":
-                    rel_x = event.pos[0] - smooth_factor_slider.x
-                    current_smooth = min_smooth + (max_smooth - min_smooth) * (rel_x / SLIDER_WIDTH)
-                    current_smooth = max(min_smooth, min(max_smooth, current_smooth))
-                elif slider_grabbed == "thickness":
-                    rel_x = event.pos[0] - trail_thickness_slider.x
-                    current_thickness = int(min_thickness + 
-                        (max_thickness - min_thickness) * (rel_x / SLIDER_WIDTH))
-                    current_thickness = max(min_thickness, min(max_thickness, current_thickness))
-                elif slider_grabbed == "active_area_thickness":
-                    thickness_slider_rect = pygame.Rect(350, 80 + 105, 150, 15)
-                    rel_x = event.pos[0] - thickness_slider_rect.x
-                    active_area_thickness = int(1 + (rel_x / 150) * 4)  # 1-5 range
-                    active_area_thickness = max(1, min(5, active_area_thickness))
+                drag_slider(event.pos[0])
             
             # Handle color picker dragging
             if color_picker_dragging and color_picker_open:
@@ -2765,7 +2727,7 @@ while running:
                         # Calculate hue and saturation from drag position
                         dx = event.pos[0] - wheel_center[0]
                         dy = event.pos[1] - wheel_center[1]
-                        angle = np.degrees(np.arctan2(dy, dx)) % 360
+                        angle = math.degrees(math.atan2(dy, dx)) % 360
                         saturation = min(100, (distance / wheel_radius) * 100)
                         
                         color_picker_hue = angle
@@ -2824,8 +2786,8 @@ while running:
                     color_picker_type = None
             
             elif active_input is not None:
-                if event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER:
-                    # Apply the value
+                if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_TAB):
+                    # Apply the value; Tab then moves to the next field
                     input_error = False
                     error_message = ""
                     
@@ -2885,11 +2847,14 @@ while running:
                                     trail_color = tuple(trail_rgb_values)
                                 elif active_input.startswith("active"):
                                     index = int(active_input.split("_")[1])
-                                    active_area_values[index] = 1  # Default minimum value
-                                    active_width = active_area_values[2]
-                                    active_height = active_area_values[3]
+                                    active_area_values[index] = 0 if index == 4 else 1  # Default minimum value
+                                    active_area_x, active_area_y, active_area_width, active_area_height, active_area_rotation = active_area_values
+                                elif active_input.startswith("region"):
+                                    index = int(active_input.split("_")[1])
+                                    region_values[index] = REGION_DEFAULTS[index]
+                                    set_view()
                             else:
-                                value = int(input_text)
+                                value = float(input_text) if active_input.startswith(("active", "region")) else int(input_text)
 
                                 if active_input.startswith("cursor"):
                                     index = int(active_input.split("_")[1])
@@ -2907,20 +2872,43 @@ while running:
 
                                 elif active_input.startswith("active"):
                                     index = int(active_input.split("_")[1])
-                                    if value < 1:
+                                    if value < 1 and index != 4:  # rotation takes any angle
                                         input_error = True
                                         error_message = "Active area values must be at least 1"
                                     else:
                                         active_area_values[index] = value
-                                        active_width = active_area_values[2]
-                                        active_height = active_area_values[3]
+                                        active_area_x, active_area_y, active_area_width, active_area_height, active_area_rotation = active_area_values
+
+                                elif active_input.startswith("region"):
+                                    index = int(active_input.split("_")[1])
+                                    low, high = REGION_LIMITS[index]
+                                    if not low <= value <= high:
+                                        input_error = True
+                                        error_message = f"{REGION_LABELS[index]}: {low:g} to {high:g}"
+                                    else:
+                                        region_values[index] = value
+                                        set_view()
 
                         except ValueError:
                             input_error = True
                             error_message = "Please enter a valid number"
                     
                     # Only clear if no error
-                    if not input_error:
+                    if input_error:
+                        pass
+                    elif event.key == pygame.K_TAB:
+                        order = tab_order()
+                        tab_step = -1 if event.mod & pygame.KMOD_SHIFT else 1
+                        active_input = order[(order.index(active_input) + tab_step) % len(order)] if active_input in order else order[0]
+                        if active_input.endswith("_hex"):
+                            input_text = rgb_to_hex(*{"cursor_hex": cursor_rgb_values, "trail_hex": trail_rgb_values,
+                                                      "rectangle_hex": active_area_rgb_values,
+                                                      "background_hex": background_rgb_values}[active_input])
+                        elif active_input.startswith("region"):
+                            input_text = f"{region_values[int(active_input.split('_')[1])]:g}"
+                        else:
+                            input_text = str(active_area_values[int(active_input.split("_")[1])])
+                    else:
                         active_input = None
                         input_text = ""
 
@@ -2930,73 +2918,6 @@ while running:
                     input_text = ""
                     input_error = False
                     error_message = ""
-
-                elif event.key == pygame.K_TAB:
-                    # Tab navigation between input boxes
-                    if event.mod & pygame.KMOD_SHIFT:
-                        # Shift+Tab - go backwards
-                        if active_input.startswith("cursor"):
-                            if active_input == "cursor_0":
-                                active_input = "active_3"  # Go to last active area input
-                            else:
-                                index = int(active_input.split("_")[1])
-                                active_input = f"cursor_{index-1}"
-                        elif active_input.startswith("trail"):
-                            if active_input == "trail_0":
-                                active_input = "cursor_2"  # Go to last cursor input
-                            else:
-                                index = int(active_input.split("_")[1])
-                                active_input = f"trail_{index-1}"
-                        elif active_input.startswith("active"):
-                            if active_input == "active_0":
-                                active_input = "trail_2"  # Go to last trail input
-                            else:
-                                index = int(active_input.split("_")[1])
-                                active_input = f"active_{index-1}"
-                    else:
-                        # Tab - go forwards
-                        if active_input.startswith("cursor"):
-                            if active_input == "cursor_2":
-                                active_input = "trail_0"  # Go to first trail input
-                            else:
-                                index = int(active_input.split("_")[1])
-                                active_input = f"cursor_{index+1}"
-                        elif active_input.startswith("trail"):
-                            if active_input == "trail_2":
-                                active_input = "active_0"  # Go to first active area input
-                            else:
-                                index = int(active_input.split("_")[1])
-                                active_input = f"trail_{index+1}"
-                        elif active_input.startswith("active"):
-                            if active_input == "active_3":
-                                active_input = "cursor_0"  # Go to first cursor input
-                            else:
-                                index = int(active_input.split("_")[1])
-                                active_input = f"active_{index+1}"
-                    
-                    # Clear error state when switching inputs
-                    input_error = False
-                    error_message = ""
-                    
-                    # Update input text for the new active input
-                    if active_input.startswith("cursor") and not active_input.endswith("_hex"):
-                        index = int(active_input.split("_")[1])
-                        input_text = str(cursor_rgb_values[index])
-                    elif active_input.startswith("trail") and not active_input.endswith("_hex"):
-                        index = int(active_input.split("_")[1])
-                        input_text = str(trail_rgb_values[index])
-                    elif active_input.startswith("active"):
-                        index = int(active_input.split("_")[1])
-                        input_text = str(active_area_values[index])
-                    elif active_input.endswith("_hex"):
-                        if active_input == "cursor_hex":
-                            input_text = rgb_to_hex(*cursor_rgb_values)
-                        elif active_input == "trail_hex":
-                            input_text = rgb_to_hex(*trail_rgb_values)
-                        elif active_input == "rectangle_hex":
-                            input_text = rgb_to_hex(*active_area_rgb_values)
-                        elif active_input == "background_hex":
-                            input_text = rgb_to_hex(*background_rgb_values)
 
                 elif event.key == pygame.K_BACKSPACE:
                     # Start backspace hold
@@ -3029,6 +2950,11 @@ while running:
                         # Update color in real-time for RGB inputs
                         if active_input.startswith("cursor") or active_input.startswith("trail"):
                             update_color_in_realtime()
+                    # Area and region values take decimals; rotation may be negative
+                    elif active_input.startswith(("active", "region")) and (
+                            (event.unicode == "." and "." not in input_text)
+                            or (event.unicode == "-" and active_input == "active_4" and not input_text)):
+                        input_text += event.unicode
         
         elif event.type == pygame.KEYUP:
             # Stop backspace hold when key is released
@@ -3044,26 +2970,10 @@ while running:
                     set_borderless(not borderless)
                     tooltip_active = False
                 elif event.key == pygame.K_2:
-                    # Option 2: Hide UI (but keep minimap)
-                    if hide_ui and not hide_minimap:
-                        # Already in option 2 mode, revert to normal
-                        hide_ui = False
-                        hide_minimap = False
-                    else:
-                        # Switch to option 2 mode
-                        hide_ui = True
-                        hide_minimap = False
+                    toggle_overlay_mode(False)  # Option 2: Hide UI (but keep minimap)
                     tooltip_active = False
                 elif event.key == pygame.K_3:
-                    # Option 3: Hide UI + minimap
-                    if hide_ui and hide_minimap:
-                        # Already in option 3 mode, revert to normal
-                        hide_ui = False
-                        hide_minimap = False
-                    else:
-                        # Switch to option 3 mode
-                        hide_ui = True
-                        hide_minimap = True
+                    toggle_overlay_mode(True)  # Option 3: Hide UI + minimap
                     tooltip_active = False
 
 
@@ -3089,4 +2999,6 @@ while running:
 
 
 
+sampler_stop.set()
+sampler.join(1)
 pygame.quit()

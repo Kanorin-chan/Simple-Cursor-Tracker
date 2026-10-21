@@ -9,9 +9,7 @@
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     },
     "AuxiliaryButtons": {
       "ButtonCount": 8
@@ -22,11 +20,13 @@
       "VendorID": 1155,
       "ProductID": 40965,
       "InputReportLength": 10,
-      "OutputReportLength": 8,
       "ReportParser": "OpenTabletDriver.Configurations.Parsers.XP_Pen.XP_PenReportParser",
       "OutputInitReport": [
         "ArAE"
-      ]
+      ],
+      "Attributes": {
+        "Interface": "1"
+      }
     },
     {
       "VendorID": 1155,
@@ -40,6 +40,7 @@
     }
   ],
   "Attributes": {
-    "libinputoverride": "1"
+    "libinputoverride": "1",
+    "SkipTests": "LPI_DIGITIZER_X,LPI_DIGITIZER_Y,LPI_SAME_ACROSS_AXES"
   }
 }

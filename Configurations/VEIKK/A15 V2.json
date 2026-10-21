@@ -3,15 +3,13 @@
   "Specifications": {
     "Digitizer": {
       "Width": 254,
-      "Height": 152.4,
+      "Height": 158.75,
       "MaxX": 50800,
       "MaxY": 31750
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     },
     "AuxiliaryButtons": {
       "ButtonCount": 12

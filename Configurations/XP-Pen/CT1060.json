@@ -1,5 +1,5 @@
 {
-  "Name": "XP-Pen CT1060",
+  "Name": "XP-Pen Deco Fun L (CT1060)",
   "Specifications": {
     "Digitizer": {
       "Width": 254.505,
@@ -9,9 +9,7 @@
     },
     "Pen": {
       "MaxPressure": 8191,
-      "Buttons": {
-        "ButtonCount": 2
-      }
+      "ButtonCount": 2
     }
   },
   "DigitizerIdentifiers": [
@@ -19,7 +17,6 @@
       "VendorID": 10429,
       "ProductID": 2354,
       "InputReportLength": 12,
-      "OutputReportLength": 10,
       "ReportParser": "OpenTabletDriver.Configurations.Parsers.XP_Pen.XP_PenReportParser",
       "OutputInitReport": [
         "ArAE"
