@@ -1,0 +1,15 @@
+# Per-machine runtime state (written by the app, holds local paths)
+settings_config.json
+last_settings_path.json
+cursor_settings.json
+
+# Build output
+build/
+dist/
+*.spec
+__pycache__/
+
+# Local tooling
+.superpowers/
+# Framework-dependent daemon stub; needs DLLs that aren't in the repo
+OpenTabletDriver.Daemon/

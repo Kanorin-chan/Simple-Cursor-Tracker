@@ -1,151 +1,110 @@
-# Cursor Tracker – Python Cursor Tracking Tool for Tablets & OBS
+# Simple Cursor Tracker
 
-Cursor Tracker is a Python-based desktop utility for **real-time cursor visualization**, designed for **OpenTabletDriver** users.  
-It features **customizable trails, colors, tablet area mapping, and OBS overlay support**, making it perfect for **digital artists, streamers, and educators**.  
+A small Windows overlay that draws your pen or mouse movement as a fading trail, with a mini-map of your tablet's active area. It's made for **OpenTabletDriver** users who want to show their cursor movement on stream (osu!, drawing, tutorials).
 
-With automatic tablet detection and full OpenTabletDriver integration, setup is simple—just run and start tracking!
- 
-## Features 
- 
-- **Real-time cursor tracking** with smooth movement visualization 
-- **Customizable cursor trail** with fade effects and adjustable length 
-- **Color customization** for cursor, trail, and background 
-- **Tablet area mapping** with active area visualization 
-- **Mini-map display** showing full tablet area and cursor position 
-- **Settings persistence** - save and load your preferences 
-- **OBS overlay support** with borderless window options 
-- **OpenTabletDriver integration** - automatically detects tablet configurations 
-- **Automated tablet detection** using a custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` (no manual selection required for most tablets; included in the install package)
+![Simple Cursor Tracker running borderless over an osu! editor](docs/demo.gif)
 
-## Installation 
- 
-### Prerequisites 
-- Python 3.7+ 
-- OpenTabletDriver (optional, for tablet configuration detection) 
-- **The custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` is already included in the install package. You do not need to manually place it beside the executable.**
- 
-### Dependencies 
-```bash 
-pip install pygame pyautogui numpy 
-``` 
- 
-### Building the Executable 
-```bash 
-# Install PyInstaller 
-pip install pyinstaller 
- 
-# Build executable with configurations 
+**[⬇ Download the latest release](https://github.com/Kanorin-chan/Simple-Cursor-Tracker/releases/latest)** · Windows only
+
+---
+
+## What it does
+
+- **Live cursor trail.** Your whole primary monitor is scaled into an 800×600 window, and the cursor leaves a smoothed trail that fades out.
+- **Tablet mini-map.** It shows the full tablet surface, your active area as a rectangle, and where the pen is.
+- **Automatic tablet detection.** On launch it briefly runs a bundled OpenTabletDriver daemon to identify your tablet. It then reads your area from OTD's `Settings.json` and the tablet's physical size from the bundled configuration files.
+- **OBS-friendly modes.** You can switch to a borderless window and hide the UI, or the UI and the mini-map, so a window capture shows only the trail.
+- **Customisable.** You can change the cursor, trail, rectangle and background colours (hex or colour picker), the trail length, smoothness and thickness, and the grids. You can save and load presets as JSON.
+
+## Quick start
+
+1. Download the latest release and extract it. The `.rar` needs 7-Zip or WinRAR.
+2. Plug in your tablet.
+3. Run `CursorTracker.exe`. On first launch it asks you:
+   - **Which OTD `Settings.json` to use.** Choose **Yes** to use the default `%LocalAppData%\OpenTabletDriver\Settings.json`. The app remembers your choice.
+   - **Which cursor settings preset to load.** On a first run you don't have one yet, so press **Cancel** to start with the defaults.
+4. Move your pen. The trail appears in the main window and the dot moves on the mini-map.
+
+Run `CursorTracker.exe -console` to keep the console open and see the detection log.
+
+## Using it with OBS
+
+Press **Alt** in the tracker window to open the overlay menu, then press a number:
+
+| Key | Effect |
+|---|---|
+| `1` | Toggle a borderless window (no title bar) |
+| `2` | Hide the UI and keep the mini-map. Press again to show it. |
+| `3` | Hide the UI and the mini-map. Press again to show them. |
+
+The number keys only work while the Alt menu is open. Pressing Alt again closes the menu.
+
+In OBS, add a **Window Capture** of *Simple Cursor Tracking*. To remove the background, set a solid background colour in Settings (for example pure green `#00FF00`) and add a **Chroma Key** filter.
+
+## Settings panel
+
+Click **Settings** in the bottom-left corner to open the panel, and click **Close** to go back.
+
+| Section | Options |
+|---|---|
+| Colours | Cursor, trail, active-area rectangle and background. Type a hex value or click a swatch to open the picker. |
+| Trail | Trail on/off, fade on/off, length (5–50 points), smoothness (0.1–1.0, lower is smoother but lags more), thickness (1–10) |
+| Rectangle | Active-area outline thickness (1–5) |
+| Grid | Main-window grid, mini-map grid, show/hide the mini-map |
+| Active Area (mm) | Read from OTD and locked by default. Click the shield 3 times within 3 seconds to unlock manual editing. |
+| File | **Save** writes a preset JSON, **Load** opens one, **Reset** restores the defaults. |
+
+## Files it creates
+
+These are written next to the executable (or next to `cursortracker.py` when you run from source):
+
+| File | Holds |
+|---|---|
+| `settings_config.json` | The path to your OpenTabletDriver `Settings.json` |
+| `last_settings_path.json` | The last cursor preset you saved or loaded. It loads automatically on the next launch. |
+| `cursor_settings.json` | The default name for a saved preset. You can save it anywhere. |
+
+## Run from source
+
+Requires Windows and Python 3.12 (the version it was tested on).
+
+```bash
+pip install -r requirements.txt
+python cursortracker.py
+```
+
+`pywin32` is optional. It only brings the window back to the front after a file dialog closes.
+
+### Build the executable
+
+```bash
+pip install pyinstaller
 pyinstaller --onefile --console ^
---add-data "Configurations;Configurations" ^
---add-data "cursor_logo.png;." ^
---add-data "cursor_logo.ico;." ^
---add-data "opentabletdriver.customdaemon.exe;." ^
---name "CursorTracker" cursortracker.py
-``` 
+  --add-data "Configurations;Configurations" ^
+  --add-data "cursor_logo.png;." ^
+  --add-data "cursor_logo.ico;." ^
+  --add-data "OpenTabletDriver.CustomDaemon.exe;." ^
+  --icon cursor_logo.ico ^
+  --name "CursorTracker" cursortracker.py
+```
 
-## Use Cases
-- 🎨 Digital artists who want to visualize their pen movement
-- 🎥 Streamers who want cursor trails in OBS overlays
-- 🖱️ Developers testing cursor & input tracking
-- 📊 Educators making tutorials with live cursor visualization
+The console is hidden at runtime unless you pass `-console`.
 
-## Usage 
- 
-### Running the Application 
- 
-**Normal mode (hidden console):** 
-```bash 
-CursorTracker.exe 
-``` 
- 
-**Debug mode (visible console):** 
-```bash 
-CursorTracker.exe -console 
-``` 
- 
-### Tablet Detection (Automation)
+## Known issues
 
-- The application now features **automatic tablet detection** using a custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe`.
-- **The custom daemon executable is included in the install package. No manual placement is required.**
-- When you launch the app, it will attempt to detect your connected tablet automatically and select the correct configuration.
-- If your tablet is not detected, you will be prompted to select a similar configuration manually.
-- This automation reduces setup time and improves user experience for most OpenTabletDriver-compatible tablets.
+- **A file picker opens on every launch.** It happens until you save a preset once with **Save**. Pressing Cancel is safe.
+- **The borderless window isn't always-on-top**, and you can't drag it. Position the window before you switch to borderless.
+- **Very fast strokes look slightly angular.** The cursor is sampled once per frame (60 Hz).
+- **With fade on, the trail fades toward black**, not toward your background colour. It can show a dark fringe on a chroma-key background.
+- **The app crashes at startup if no tablet is detected** within about 3 seconds of launch (`NameError: target_tablet`). Plug the tablet in before you launch.
 
-### Controls 
- 
-- **Settings Button**: Opens the settings panel 
-- **Alt Key**: Toggle OBS overlay options 
-- **1 Key**: Toggle borderless window mode 
-- **2 Key**: Hide UI elements 
-- **3 Key**: Hide UI + mini-map 
- 
-### Settings Panel 
- 
-The settings panel allows you to customize: 
- 
-- **Colors**: Cursor, trail, rectangle, and background colors 
-- **Trail Settings**: Length, smoothness, thickness, and fade effects 
-- **Grid Settings**: Enable/disable grids on main and mini displays 
-- **Active Area**: Configure tablet active area dimensions 
-- **File Operations**: Save, load, and reset settings 
- 
-## Configuration 
- 
-### Tablet Configuration Files 
- 
-This application includes tablet configuration files from [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver). These files contain digitizer specifications for various tablet models and are used to automatically detect tablet dimensions. 
+## Troubleshooting
 
-**Automatic Detection:**
-- The app uses a custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` to detect your connected tablet and select the appropriate configuration automatically.
-- The daemon is included in the install package.
-- If detection fails, you can still manually select a configuration from the provided list.
+- **Closes a few seconds after launch**: no tablet was detected (see Known issues). Plug the tablet in, then run with `-console` to see the detector output.
+- **Wrong tablet size on the mini-map**: your model may be missing from `Configurations/`. The app asks you to pick a similar model.
+- **Trail feels laggy**: raise *Smoothness* toward 1.0, or shorten the trail.
 
-**Credits:** Tablet configuration files are sourced from the [OpenTabletDriver project](https://github.com/OpenTabletDriver/OpenTabletDriver) under LGPL-3.0 license. 
- 
-### Settings Files 
- 
-The application creates several configuration files in the same directory as the executable: 
- 
-- `cursor_settings.json` - Main application settings 
-- `settings_config.json` - OpenTabletDriver settings path 
-- `last_settings_path.json` - Last used settings file path 
- 
-## Troubleshooting 
- 
-### Common Issues 
- 
-**Tablet not detected:** 
-- Ensure OpenTabletDriver is running 
-- Check that your tablet is properly connected 
-- Verify OpenTabletDriver settings.json path is correct 
-- The custom `opentabletdriver.daemon.exe` or `opentabletdriver.customdaemon.exe` is included in the install package.
- 
-**Configuration not found:** 
-- The application will prompt you to select a similar tablet configuration 
-- You can manually select from the available configurations 
- 
-**Performance issues:** 
-- Reduce trail length in settings 
-- Disable trail fade effects 
-- Lower trail thickness 
- 
-## Building from Source 
- 
-### Development Setup 
-```bash 
-# Clone or download the source code 
-# Install dependencies 
-pip install pygame pyautogui numpy 
- 
-# Run the application 
-python cursortracker.py 
-``` 
- 
-## License 
- 
-This project is open source. The tablet configuration files are sourced from [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver) under LGPL-3.0 license. 
- 
-## Credits 
- 
-- **Tablet Configurations**: [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver) - Open source, cross-platform tablet driver 
-- **Python Libraries**: pygame, pyautogui, numpy 
+## Credits
+
+- Tablet configuration files and the bundled detector daemon (`OpenTabletDriver.CustomDaemon.exe`, built from OpenTabletDriver 0.6.5.1) come from [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver), licensed under **LGPL-3.0**.
+- Built with [pygame](https://www.pygame.org/), pyautogui, numpy and psutil.
