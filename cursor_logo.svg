@@ -1,0 +1,19 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Trail: fading gradient -->
+  <defs>
+    <linearGradient id="trailGradient" x1="60" y1="196" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4A90E2" stop-opacity="0.1"/>
+      <stop offset="0.7" stop-color="#4A90E2" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#4A90E2" stop-opacity="1"/>
+    </linearGradient>
+    <radialGradient id="dotGradient" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="1"/>
+      <stop offset="60%" stop-color="#7EC8FF" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#4A90E2" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- Trail (curved path, thinner) -->
+  <path d="M60 196 Q100 160 128 128" stroke="url(#trailGradient)" stroke-width="10" stroke-linecap="round" fill="none"/>
+  <!-- Fading dot (brighter, on top) -->
+  <circle cx="128" cy="128" r="32" fill="url(#dotGradient)"/>
+</svg> 
